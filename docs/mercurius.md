@@ -25,7 +25,7 @@ cmake --build build -j --target llama-server llama-cli
 
 | Backend | Status |
 |---|---|
-| NVIDIA CUDA, Ampere and newer (RTX 30xx/40xx/50xx, A100, H100, Jetson Orin/Thor) | Supported. Tested on Jetson AGX Orin (sm_87). |
+| NVIDIA CUDA, Ampere and newer (RTX 30xx/40xx/50xx, A100, H100, Jetson Orin/Thor) | Supported. Tested on Jetson AGX Orin (sm_87); other GPUs not yet tested. |
 | NVIDIA CUDA, Turing (RTX 20xx, T4) | Should work: kernels compile for sm_75 (plain copies replace `cp.async`); not run-tested. |
 | NVIDIA Volta and older | Not supported (the sliced prefill needs Turing tensor-core MMA; current CUDA toolkits no longer target sm_70). |
 | CPU | Works (every new op has a CPU implementation), but slow. |
