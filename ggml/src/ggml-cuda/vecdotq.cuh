@@ -1310,6 +1310,29 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
 
+// NF4 x Q8_1: float levels (exact NF4 values), so a float accumulation instead of dp4a. One call covers 2 code words
+// = 16 values, all inside ONE q8_1 block (iqs in {0, 2, 4, 6}): element e of the NF4 block is byte e/2 (even e low
+// nibble), and q8_1 block e/32 position e%32.
+#define VDR_NF4_Q8_1_MMVQ 2
+
+static __device__ __forceinline__ float vec_dot_nf4_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_nf4  * b = (const block_nf4 *) vbq + kbx;
+    const block_q8_1 * y = bq8_1 + iqs/4;
+    const int8_t * q8 = (const int8_t *) y->qs + 8*(iqs % 4);
+    float sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < VDR_NF4_Q8_1_MMVQ; ++l) {
+        const uint32_t aux = (uint32_t) get_int_b4(b->qs, iqs + l);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t c = (aux >> (8*k)) & 0xff;
+            sum += kvalues_nf4[c & 0xf] * q8[8*l + 2*k] + kvalues_nf4[c >> 4] * q8[8*l + 2*k + 1];
+        }
+    }
+    return sum * b->d * __low2float(y->ds);
+}
+
 #define VDR_IQ4_NL_Q8_1_MMVQ 2
 #define VDR_IQ4_NL_Q8_1_MMQ  4
 

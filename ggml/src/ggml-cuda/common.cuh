@@ -1119,6 +1119,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ1_M> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_NF4> {
+    static constexpr int qk = QK_NF4;
+    static constexpr int qr = 2;
+    static constexpr int qi = QK_NF4 / (4*2);    // 32-bit words of codes per block
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ4_NL> {
     static constexpr int qk = QK4_NL;
     static constexpr int qr = QR4_NL;

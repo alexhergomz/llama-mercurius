@@ -2807,8 +2807,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S ||
-                               src0->type == GGML_TYPE_NF4);   // NF4: dequantize + cuBLAS (no MMVQ/MMQ kernels yet)
+    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_tq_weight &&
                              src0->type != GGML_TYPE_Q8_CR &&
                              src0->type != GGML_TYPE_Q5_CR &&
@@ -3015,7 +3014,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // TQ weight types use the fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill),
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
-    // NF4 never reaches mmvq/mmq (ggml_cuda_should_use_mmvq/mmq refuse it): dequantize + cuBLAS below.
+    // NF4: mmvq for small batches (vec_dot_nf4_q8_1), never mmq (refused): dequantize + cuBLAS above that.
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
