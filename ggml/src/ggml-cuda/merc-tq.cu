@@ -899,8 +899,16 @@ extern template void ggml_cuda_flash_attn_ext_mma_f16_case<448, 256, 16, 4>(ggml
 extern template void ggml_cuda_flash_attn_ext_mma_f16_partial_case<448, 256, 16, 4>(
         ggml_backend_cuda_context &, ggml_tensor *, float *, float2 *);
 
+// rows of r values (f16 or f32) -> f16 rows of kp >= r values, zero-filled
+static __global__ void merc_pad_rows_f16(const void * x, bool x_f16, int r, int kp, int64_t nrows, half * y) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nrows * kp) return;
+    const int64_t row = i / kp; const int e = (int) (i % kp);
+    y[i] = e >= r ? __float2half(0.0f) : x_f16 ? ((const half *) x)[row * r + e] : __float2half(((const float *) x)[row * r + e]);
+}
+
 struct merc_prefill_layout {
-    int64_t S, CH, Ep, nkn, row_halves, nrows;
+    int64_t S, CH, Ep, kp, nkn, row_halves, nrows;
     size_t off_kd, off_rms, off_kn, off_kv, off_ku, off_vu, off_acc, off_accm, off_part, off_partm, total;
 };
 
@@ -923,8 +931,11 @@ static merc_prefill_layout merc_prefill_get_layout(const ggml_tensor * dst) {
     L.off_rms  = take(sizeof(float) * ((L.S + 63) / 64 * 64) * 4);
     L.off_kn   = take(sizeof(half)  * L.CH * L.nkn);
     L.off_kv   = take(sizeof(half)  * L.S * L.row_halves);
-    L.off_ku   = take(ku->type == GGML_TYPE_F32 ? sizeof(half) * r * L.nkn : 0);
-    L.off_vu   = take(vu->type == GGML_TYPE_F32 ? sizeof(half) * r * D * G : 0);
+    // up-projections as f16 with the inner dimension zero-padded to the decoded latent's width (multiple of 16):
+    // cuBLAS tensor-core GEMMs need aligned leading dimensions, and r (e.g. 579) is odd
+    L.kp       = L.Ep - rd;
+    L.off_ku   = take(sizeof(half) * L.kp * L.nkn);
+    L.off_vu   = take(sizeof(half) * L.kp * D * G);
     L.off_acc  = take(sliced ? sizeof(float)  * L.nrows * D : 0);
     L.off_accm = take(sliced ? sizeof(float2) * L.nrows     : 0);
     L.off_part = take(sliced ? sizeof(float)  * L.nrows * D : 0);
@@ -977,17 +988,9 @@ void ggml_cuda_op_merc_tq_prefill(ggml_backend_cuda_context & ctx, ggml_tensor *
     cudaStream_t st = ctx.stream();
     const int64_t nb_cell = pk->ne[1] == 1 ? pk->nb[2] : pk->nb[1];
 
-    const half * KU = (const half *) ku->data, * VU = (const half *) vu->data;
-    if (ku->type == GGML_TYPE_F32) {
-        half * t = (half *) (ws + L.off_ku);
-        merc_f32_to_f16<<<((int64_t) r * L.nkn + 255) / 256, 256, 0, st>>>((const float *) ku->data, t, (int64_t) r * L.nkn);
-        KU = t;
-    }
-    if (vu->type == GGML_TYPE_F32) {
-        half * t = (half *) (ws + L.off_vu);
-        merc_f32_to_f16<<<((int64_t) r * D * G + 255) / 256, 256, 0, st>>>((const float *) vu->data, t, (int64_t) r * D * G);
-        VU = t;
-    }
+    half * KU = (half *) (ws + L.off_ku), * VU = (half *) (ws + L.off_vu);
+    merc_pad_rows_f16<<<(int) ((L.kp * L.nkn + 255) / 256), 256, 0, st>>>(ku->data, ku->type == GGML_TYPE_F16, r, (int) L.kp, L.nkn, KU);
+    merc_pad_rows_f16<<<(int) ((L.kp * D * G + 255) / 256), 256, 0, st>>>(vu->data, vu->type == GGML_TYPE_F16, r, (int) L.kp, (int64_t) D * G, VU);
     const size_t smem_d = sizeof(float) * (rd * rd + 8 * rd + 32) + sizeof(uint32_t) * 64 * pk->ne[0];
     CUDA_CHECK(cudaFuncSetAttribute(merc_tq_decode_f16, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_d));
     CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), st));
@@ -1019,11 +1022,11 @@ void ggml_cuda_op_merc_tq_prefill(ggml_backend_cuda_context & ctx, ggml_tensor *
             const int ncc = (int) std::min<int64_t>(L.CH, nc - j0);
             const half * C = kd + (int64_t) j0 * L.Ep + rd;       // latent, column-major r x ncc, ld Ep
             // key features (nkn x ncc) = KU^T C into the chunk buffer; values (G*D x ncc) = VU^T C into the slice rows
-            CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, (int) L.nkn, ncc, r,
-                &alpha, KU, CUDA_R_16F, r, C, CUDA_R_16F, (int) L.Ep, &beta, kn, CUDA_R_16F, (int) L.nkn,
+            CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, (int) L.nkn, ncc, (int) L.kp,
+                &alpha, KU, CUDA_R_16F, (int) L.kp, C, CUDA_R_16F, (int) L.Ep, &beta, kn, CUDA_R_16F, (int) L.nkn,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, G * D, ncc, r,
-                &alpha, VU, CUDA_R_16F, r, C, CUDA_R_16F, (int) L.Ep, &beta, kv + (int64_t) j0 * L.row_halves + G * Ek,
+            CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, G * D, ncc, (int) L.kp,
+                &alpha, VU, CUDA_R_16F, (int) L.kp, C, CUDA_R_16F, (int) L.Ep, &beta, kv + (int64_t) j0 * L.row_halves + G * Ek,
                 CUDA_R_16F, (int) L.row_halves, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             merc_tq_expand_assemble<<<ncc, 256, 0, st>>>(kd, (int) L.Ep, rmsd, kn, nullptr, kv, rowb,
                 j0, ncc, G, rd, nres, nope, D);
