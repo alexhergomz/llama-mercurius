@@ -3714,6 +3714,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MERC_TQ_UNPACK:
             ggml_cuda_op_merc_tq_unpack(ctx, dst);
             break;
+        case GGML_OP_MERC_TQ_ATTN:
+            ggml_cuda_op_merc_tq_attn(ctx, dst);
+            break;
+        case GGML_OP_MERC_TQ_EXPAND:
+            ggml_cuda_op_merc_tq_expand(ctx, dst);
+            break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -5608,6 +5614,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// GGML_CUDA_OP_PROFILE=1: time every node with CUDA events (CUDA graphs off), print the total per op kind
+// (matmuls keyed by weight type and batch width) at exit. Development aid; adds a sync per node.
+#include <map>
+#include <string>
+struct ggml_cuda_op_profile {
+    bool on = getenv("GGML_CUDA_OP_PROFILE") != nullptr;
+    std::map<std::string, std::pair<double, long>> acc;
+    ~ggml_cuda_op_profile() {
+        if (!on || acc.empty()) return;
+        std::vector<std::pair<double, std::string>> v;
+        double tot = 0;
+        for (auto & kv : acc) { v.push_back({kv.second.first, kv.first}); tot += kv.second.first; }
+        std::sort(v.rbegin(), v.rend());
+        fprintf(stderr, "\n== GGML_CUDA_OP_PROFILE: %.1f ms total ==\n", tot);
+        for (size_t i = 0; i < v.size() && i < 40; ++i) {
+            fprintf(stderr, "%9.1f ms %5.1f%%  n=%-7ld %s\n", v[i].first, 100 * v[i].first / tot, acc[v[i].second].second, v[i].second.c_str());
+        }
+    }
+};
+static ggml_cuda_op_profile g_cuda_op_profile;
+
+static std::string ggml_cuda_op_profile_key(const ggml_tensor * node) {
+    std::string k = ggml_op_desc(node);
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
+        k += std::string(" ") + ggml_type_name(node->src[0]->type) + (node->src[1] && node->src[1]->ne[1] == 1 ? " vec" : " mat");
+    }
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
+        const char * n = node->src[0]->name;                     // "blk.N.attn_qkv.weight" -> "attn_qkv.weight"
+        const char * d2 = strncmp(n, "blk.", 4) == 0 ? strchr(n + 4, '.') : nullptr;
+        k += std::string(" ") + (d2 ? d2 + 1 : (strncmp(n, "node_", 5) == 0 ? "(activation)" : n));
+    }
+    return k;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5799,7 +5839,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                cudaEvent_t prof_e0 = nullptr, prof_e1 = nullptr;
+                if (g_cuda_op_profile.on) {
+                    CUDA_CHECK(cudaEventCreate(&prof_e0)); CUDA_CHECK(cudaEventCreate(&prof_e1));
+                    CUDA_CHECK(cudaEventRecord(prof_e0, cuda_ctx->stream()));
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (g_cuda_op_profile.on) {
+                    CUDA_CHECK(cudaEventRecord(prof_e1, cuda_ctx->stream()));
+                    CUDA_CHECK(cudaEventSynchronize(prof_e1));
+                    float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, prof_e0, prof_e1));
+                    auto & a = g_cuda_op_profile.acc[ggml_cuda_op_profile_key(node)];
+                    a.first += ms; a.second += 1;
+                    cudaEventDestroy(prof_e0); cudaEventDestroy(prof_e1);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5854,6 +5907,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    if (g_cuda_op_profile.on) {
+        return false;                                   // per-node timing needs eager launches
+    }
 
     if (graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
@@ -5916,6 +5972,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    if (g_cuda_op_profile.on) {
+        use_cuda_graph = false;                         // per-node timing needs eager launches
+    }
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -6996,6 +7055,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MERC_TQ_PACK:
         case GGML_OP_MERC_TQ_UNPACK:
             return true;
+        case GGML_OP_MERC_TQ_EXPAND:
+            return op->src[2]->ne[0] == 31 && op->op_params[2] <= 4;
+        case GGML_OP_MERC_TQ_ATTN:
+            return op->src[0]->ne[2] == 16 && ggml_get_op_params_i32(op, 1) % 16 == 0 &&
+                   (op->src[4]->type == GGML_TYPE_F32 || op->src[4]->type == GGML_TYPE_F16);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

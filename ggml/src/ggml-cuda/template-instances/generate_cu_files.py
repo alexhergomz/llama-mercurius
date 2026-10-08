@@ -3,10 +3,10 @@
 from glob import glob
 import os
 
-HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576]
+HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 448, 512, 576]
 
 # DKQ -> DV override for asymmetric head dims.
-HEAD_SIZES_V_OVERRIDE = {576: 512, 320: 256, 192: 128}
+HEAD_SIZES_V_OVERRIDE = {576: 512, 448: 256, 320: 256, 192: 128}
 
 TYPES_KV = ["GGML_TYPE_F16", "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0", "GGML_TYPE_BF16"]
 
@@ -92,6 +92,8 @@ for ncols in [8, 16, 32, 64]:
                 if head_size_kq == 192 and ncols2 not in (8, 16): # MiMo-V2.5
                     continue
                 if head_size_kq == 320 and ncols2 != 32: # Mistral Small 4
+                    continue
+                if head_size_kq == 448 and (ncols2 != 4 or ncols1 not in (2, 4, 8, 16)): # Mercurius expanded MLA prefill
                     continue
                 if head_size_kq == 512 and ncols2 not in (2, 4, 8): # Gemma 4 (+ MTP)
                     continue

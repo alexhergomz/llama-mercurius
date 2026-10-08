@@ -4619,6 +4619,89 @@ struct test_merc_tq : public test_case {
     }
 };
 
+// GGML_OP_MERC_TQ_ATTN: fused attention over a packed cache (cache built with GGML_OP_MERC_TQ_PACK)
+struct test_merc_tq_attn : public test_merc_tq {
+    const int n_kv, Tq, H;
+    std::string vars() override { return VARS_TO_STR4(r, n_kv, Tq, H); }
+    test_merc_tq_attn(int r = 579, int n_kv = 300, int Tq = 1, int H = 16)
+        : test_merc_tq(r, 64, 4, n_kv), n_kv(n_kv), Tq(Tq), H(H) {}
+    double max_nmse_err() override { return 5e-3; }   // pack codes may round differently per backend
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * c   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, n_kv);
+        ggml_tensor * kr  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rd, n_kv);
+        ggml_tensor * rms = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, G, n_kv);
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        ggml_tensor * cbl = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 31);
+        ggml_tensor * cbr = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 31);
+        ggml_tensor * un  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rd, rd);
+        ggml_tensor * q   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rd + r, Tq, H);
+        ggml_tensor * msk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, Tq);
+        ggml_set_name(rms, "rms"); ggml_set_name(pos, "pos"); ggml_set_name(cbl, "cbl"); ggml_set_name(cbr, "cbr");
+        ggml_set_name(un, "un"); ggml_set_name(msk, "msk"); ggml_set_name(q, "q");
+        const int bytes = 4 + 4*G + 4 + rd/2 + (r + 1)/2;
+        ggml_tensor * pk = ggml_merc_tq_pack(ctx, c, kr, rms, pos, cbl, cbr, (bytes + 3)/4);
+        pk = ggml_reshape_3d(ctx, pk, pk->ne[0], 1, n_kv);
+        return ggml_merc_tq_attn(ctx, q, pk, cbl, cbr, un, msk, r, rd, G, 0.0625f, 1e7f);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_merc_tq::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "msk") == 0) {                // causal: query i sees cells <= n_kv - Tq + i
+                std::vector<float> m((size_t) n_kv * Tq);
+                for (int i = 0; i < Tq; ++i) for (int j = 0; j < n_kv; ++j) m[(size_t) i * n_kv + j] = j <= n_kv - Tq + i ? 0.0f : -INFINITY;
+                ggml_backend_tensor_set(t, m.data(), 0, m.size() * sizeof(float));
+            } else if (strcmp(t->name, "q") == 0) {           // moderate scores: a soft, not one-hot, softmax
+                init_tensor_uniform(t, -0.15f, 0.15f);
+            } else if (strcmp(t->name, "un") == 0) {          // a rotation-like matrix
+                init_tensor_uniform(t, -0.2f, 0.2f);
+            } else if (strcmp(t->name, "pos") == 0) {
+                std::vector<int32_t> p(n_kv);
+                for (int i = 0; i < n_kv; ++i) { p[i] = i; }
+                ggml_backend_tensor_set(t, p.data(), 0, n_kv * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+// GGML_OP_MERC_TQ_EXPAND: expanded keys / values from a packed cache
+struct test_merc_tq_expand : public test_merc_tq {
+    const int n_kv;
+    const ggml_type wtype;
+    std::string vars() override { return VARS_TO_STR3(r, n_kv, wtype); }
+    test_merc_tq_expand(int r = 579, int n_kv = 300, ggml_type wtype = GGML_TYPE_F16)
+        : test_merc_tq(r, 64, 4, n_kv), n_kv(n_kv), wtype(wtype) {}
+    double max_nmse_err() override { return 5e-3; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * c   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, n_kv);
+        ggml_tensor * kr  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rd, n_kv);
+        ggml_tensor * rms = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, G, n_kv);
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        ggml_tensor * cbl = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 31);
+        ggml_tensor * cbr = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 31);
+        ggml_tensor * un  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rd, rd);
+        ggml_tensor * ku  = ggml_new_tensor_2d(ctx, wtype, r, 3 * rd + 4 * 192);
+        ggml_tensor * vu  = ggml_new_tensor_3d(ctx, wtype, r, 256, 4);
+        ggml_set_name(rms, "rms"); ggml_set_name(pos, "pos"); ggml_set_name(cbl, "cbl"); ggml_set_name(cbr, "cbr");
+        ggml_set_name(un, "un"); ggml_set_name(ku, "ku"); ggml_set_name(vu, "vu");
+        const int bytes = 4 + 4*G + 4 + rd/2 + (r + 1)/2;
+        ggml_tensor * pk = ggml_merc_tq_pack(ctx, c, kr, rms, pos, cbl, cbr, (bytes + 3)/4);
+        pk = ggml_reshape_3d(ctx, pk, pk->ne[0], 1, n_kv);
+        return ggml_merc_tq_expand(ctx, pk, cbl, cbr, un, ku, vu, r, rd, G, 1e7f);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_merc_tq::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "un") == 0 || strcmp(t->name, "ku") == 0 || strcmp(t->name, "vu") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else if (strcmp(t->name, "pos") == 0) {
+                std::vector<int32_t> p(n_kv);
+                for (int i = 0; i < n_kv; ++i) { p[i] = i; }
+                ggml_backend_tensor_set(t, p.data(), 0, n_kv * sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -10717,6 +10800,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // mixed quant and Q1_0 test cases
+    // Mercurius expanded MLA prefill: K 448, V 256, 4 KV groups x GQA 4
+    for (int nb : { 16, 33, 64, 512 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(448, 256, 4, {4, 1}, 512, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
@@ -10852,6 +10939,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_gdn2(4, 64, 5, 2, 1, 3));     // two sequences, 3 snapshots
     test_cases.emplace_back(new test_merc_tq(579, 64, 4, 33));
     test_cases.emplace_back(new test_merc_tq(390, 64, 4, 1));
+    test_cases.emplace_back(new test_merc_tq_attn(579, 300, 1, 16));
+    test_cases.emplace_back(new test_merc_tq_attn(390, 1000, 4, 16));
+    test_cases.emplace_back(new test_merc_tq_attn(656, 129, 2, 16));
+    test_cases.emplace_back(new test_merc_tq_attn(579, 300, 40, 16));   // prefill path
+    test_cases.emplace_back(new test_merc_tq_expand(579, 300, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_merc_tq_expand(427, 9000, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_merc_tq_attn(427, 1030, 77, 16));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
@@ -11335,6 +11429,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    test_cases.emplace_back(new test_merc_tq_attn(579, 15000, 1, 16));
+    test_cases.emplace_back(new test_merc_tq_attn(579, 8192, 512, 16));   // prefill-shaped
+    test_cases.emplace_back(new test_flash_attn_ext(448, 256, 4, {4, 1}, 8192, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_merc_tq_attn(579, 1000, 1, 16));
     return test_cases;
 }
 

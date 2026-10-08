@@ -83,6 +83,9 @@ void llama_model_mercurius::load_arch_tensors(llama_model_loader & ml) {
             layer.merc_rope_unrot   = create_tensor(tn(LLM_TENSOR_ATTN_ROPE_UNROT,   "weight", il), { n_rot, n_rot }, 0);
             layer.merc_latent       = create_tensor(tn(LLM_TENSOR_ATTN_LATENT,       "weight", il), { n_embd, r }, 0);
             layer.merc_v_up         = create_tensor(tn(LLM_TENSOR_ATTN_V_UP,         "weight", il), { r, D, G }, 0);
+            // expanded prefill form (optional; older files fall back to the absorbed kernel)
+            layer.merc_q_exp        = create_tensor(tn(LLM_TENSOR_ATTN_Q_EXP,        "weight", il), { D, n_rot + (G - 1) * n_rot + (D - n_rot), n_head }, TENSOR_NOT_REQUIRED);
+            layer.merc_k_up         = create_tensor(tn(LLM_TENSOR_ATTN_K_UP,         "weight", il), { r, (G - 1) * n_rot + G * (D - n_rot) }, TENSOR_NOT_REQUIRED);
             layer.merc_k_rms        = create_tensor(tn(LLM_TENSOR_ATTN_K_RMS,        "weight", il), { n_embd, D * G }, 0);
             layer.merc_tq_latent_cb = create_tensor(tn(LLM_TENSOR_ATTN_TQ_LATENT_CB, "weight", il), { 31 }, 0);
             layer.merc_tq_rope_cb   = create_tensor(tn(LLM_TENSOR_ATTN_TQ_ROPE_CB,   "weight", il), { 31 }, 0);
@@ -99,14 +102,10 @@ void llama_model_mercurius::load_arch_tensors(llama_model_loader & ml) {
                 const int64_t lr = layer.merc_a_lora_a->ne[1];
                 layer.merc_a_lora_b = create_tensor(tn(LLM_TENSOR_SSM_A_LORA_B, "weight", il), { lr, gate_out }, 0);
             }
-            const llm_tensor base[3] = { LLM_TENSOR_GATE_A_BASE, LLM_TENSOR_GATE_BE_BASE, LLM_TENSOR_GATE_BW_BASE };
-            const llm_tensor vd[3]   = { LLM_TENSOR_GATE_A_VD,   LLM_TENSOR_GATE_BE_VD,   LLM_TENSOR_GATE_BW_VD };
-            const llm_tensor vb[3]   = { LLM_TENSOR_GATE_A_VB,   LLM_TENSOR_GATE_BE_VB,   LLM_TENSOR_GATE_BW_VB };
-            for (int g = 0; g < 3; ++g) {
-                layer.merc_gate_base[g] = create_tensor(tn(base[g], "weight", il), { n_embd, n_v_heads }, 0);
-                layer.merc_gate_vd[g]   = create_tensor(tn(vd[g],   "weight", il), { vera_rank }, 0);
-                layer.merc_gate_vb[g]   = create_tensor(tn(vb[g],   "weight", il), { gate_out }, 0);
-            }
+            // the three gates stacked (rows/columns g = decay a, erase be, write bw)
+            layer.merc_gate_base = create_tensor(tn(LLM_TENSOR_GATE_BASE, "weight", il), { n_embd, 3 * n_v_heads }, 0);
+            layer.merc_gate_vd   = create_tensor(tn(LLM_TENSOR_GATE_VD,   "weight", il), { vera_rank, 3 }, 0);
+            layer.merc_gate_vb   = create_tensor(tn(LLM_TENSOR_GATE_VB,   "weight", il), { gate_out, 3 }, 0);
         }
 
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), { n_embd, n_ff }, 0);
@@ -178,27 +177,28 @@ llama_model_mercurius::graph::graph(const llama_model & model, const llm_graph_p
     ggml_build_forward_expand(gf, cur);
 }
 
-// one factored gate: tiled base (one row per value head, repeated per key channel) + VeRA [+ decay LoRA]
-ggml_tensor * llama_model_mercurius::graph::build_gate(ggml_tensor * cur, ggml_tensor * vera_u, int g, int il) {
+// the three factored gates of a GDN-2 layer at once: tiled base (one row per value head, broadcast over the key
+// channels) + VeRA B diag(vb_g) diag(vd_g) A x, with the shared A x and ONE pass over the shared B for all three.
+// Returns [dk * n_v, T, 3]: g = 0 decay a (+ its LoRA), 1 erase be, 2 write bw (pre-activation).
+ggml_tensor * llama_model_mercurius::graph::build_gates(ggml_tensor * cur, int il) {
     const auto & layer = model.layers[il];
-    const int64_t n_v_heads  = hparams.ssm_dt_rank;
-    const int64_t head_k_dim = hparams.ssm_d_state;
-    const int64_t n_tokens   = cur->ne[1];
+    const int64_t n_v  = hparams.ssm_dt_rank;
+    const int64_t dk   = hparams.ssm_d_state;
+    const int64_t T    = cur->ne[1];
+    const int64_t rank = model.merc_vera_a->ne[1];
 
-    ggml_tensor * base = ggml_mul_mat(ctx0, layer.merc_gate_base[g], cur);                 // [n_v, T]
-    base = ggml_reshape_3d(ctx0, base, 1, n_v_heads, n_tokens);
-    base = ggml_repeat_4d(ctx0, base, head_k_dim, n_v_heads, n_tokens, 1);                // [dk, n_v, T]
-    base = ggml_reshape_2d(ctx0, base, head_k_dim * n_v_heads, n_tokens);
+    ggml_tensor * u = ggml_mul_mat(ctx0, model.merc_vera_a, cur);                           // A x       [rank, T]
+    u = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, u, rank, T, 1), rank, T, 3, 1);          //           [rank, T, 3]
+    u = ggml_mul(ctx0, u, ggml_reshape_3d(ctx0, layer.merc_gate_vd, rank, 1, 3));           // diag(vd_g)
+    // as plain columns [rank, 3T]: one GEMM reading B once (a [rank, T, 3] batch takes ggml's per-slice vec path)
+    ggml_tensor * t = ggml_mul_mat(ctx0, model.merc_vera_b, ggml_reshape_2d(ctx0, u, rank, T * 3));
+    t = ggml_reshape_3d(ctx0, t, t->ne[0], T, 3);                                           // B (.)     [dk n_v, T, 3]
+    t = ggml_mul(ctx0, t, ggml_reshape_3d(ctx0, layer.merc_gate_vb, dk * n_v, 1, 3));       // diag(vb_g)
 
-    ggml_tensor * t = ggml_mul(ctx0, vera_u, layer.merc_gate_vd[g]);                      // diag(vd) A x
-    t = ggml_mul_mat(ctx0, model.merc_vera_b, t);                                         // B (.)
-    t = ggml_mul(ctx0, t, layer.merc_gate_vb[g]);                                         // diag(vb)
-    ggml_tensor * out = ggml_add(ctx0, base, t);
-
-    if (g == 0 && layer.merc_a_lora_a) {
-        out = ggml_add(ctx0, out, ggml_mul_mat(ctx0, layer.merc_a_lora_b, ggml_mul_mat(ctx0, layer.merc_a_lora_a, cur)));
-    }
-    return out;                                                                           // [dk * n_v, T]
+    ggml_tensor * base = ggml_mul_mat(ctx0, layer.merc_gate_base, cur);                     // [3 n_v, T], rows g*n_v + h
+    base = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, base, n_v, 3, T), 0, 2, 1, 3));   // [n_v, T, 3]
+    t = ggml_add(ctx0, ggml_reshape_4d(ctx0, t, dk, n_v, T, 3), ggml_reshape_4d(ctx0, base, 1, n_v, T, 3));
+    return ggml_reshape_3d(ctx0, t, dk * n_v, T, 3);                                        // decay LoRA: added by the caller
 }
 
 ggml_tensor * llama_model_mercurius::graph::build_layer_attn_linear(llm_graph_input_rs * inp, ggml_tensor * cur, int il) {
@@ -218,10 +218,16 @@ ggml_tensor * llama_model_mercurius::graph::build_layer_attn_linear(llm_graph_in
     ggml_tensor * z = ggml_mul_mat(ctx0, layer.wqkv_gate, cur);
 
     // gates
-    ggml_tensor * vera_u = ggml_mul_mat(ctx0, model.merc_vera_a, cur);                     // A x, shared
-    ggml_tensor * a  = build_gate(cur, vera_u, 0, il);
-    ggml_tensor * be = ggml_sigmoid(ctx0, build_gate(cur, vera_u, 1, il));                // erase gate b
-    ggml_tensor * bw = ggml_sigmoid(ctx0, build_gate(cur, vera_u, 2, il));                // write gate w
+    ggml_tensor * gates = build_gates(cur, il);                                            // [dk n_v, T, 3]
+    const int64_t gsz = gates->ne[0];
+    ggml_tensor * a  = ggml_view_2d(ctx0, gates, gsz, gates->ne[1], gates->nb[1], 0);
+    if (layer.merc_a_lora_a) {                                                             // decay LoRA (gate a only)
+        a = ggml_add(ctx0, a, ggml_mul_mat(ctx0, layer.merc_a_lora_b, ggml_mul_mat(ctx0, layer.merc_a_lora_a, cur)));
+    }
+    ggml_tensor * bb = ggml_sigmoid(ctx0, ggml_view_3d(ctx0, gates, gsz, gates->ne[1], 2, gates->nb[1], gates->nb[2],
+                                                       gates->nb[2]));                    // erase, write: one sigmoid
+    ggml_tensor * be = ggml_view_2d(ctx0, bb, gsz, bb->ne[1], bb->nb[1], 0);              // erase gate b
+    ggml_tensor * bw = ggml_view_2d(ctx0, bb, gsz, bb->ne[1], bb->nb[1], bb->nb[2]);      // write gate w
     cb(be, "gdn2_erase", il);
     cb(bw, "gdn2_write", il);
 
@@ -304,16 +310,19 @@ ggml_tensor * llama_model_mercurius::graph::build_layer_attn(llm_graph_input_att
     gate = ggml_cont_2d(ctx0, gate, D * H, T);
     q = build_norm(q, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);                      // [D, H, T]
 
-    // [q_rope | q_abs] = Q_MAP_h y_h   (batched over heads)
     ggml_tensor * qh = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));                 // [D, T, H]
-    ggml_tensor * qq = ggml_mul_mat(ctx0, layer.merc_q_map, qh);                           // [rd + r, T, H]
-    ggml_tensor * q_rope = ggml_view_3d(ctx0, qq, rd, T, H, qq->nb[1], qq->nb[2], 0);
-    ggml_tensor * q_abs  = ggml_view_3d(ctx0, qq, r,  T, H, qq->nb[1], qq->nb[2], rd * ggml_element_size(qq));
-    q_rope = ggml_cont(ctx0, ggml_permute(ctx0, q_rope, 0, 2, 1, 3));                      // [rd, H, T] for rope
-    q_rope = ggml_rope_ext(ctx0, q_rope, inp_pos, nullptr, rd, LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
-                           ext_factor, attn_factor, beta_fast, beta_slow);
-    q_rope = ggml_cont(ctx0, ggml_permute(ctx0, q_rope, 0, 2, 1, 3));                      // [rd, T, H]
-    ggml_tensor * q_full = ggml_concat(ctx0, q_rope, ggml_cont(ctx0, q_abs), 0);          // [rd + r, T, H]
+    // queries through a per-head map, RoPE on their first rd dims: absorbed [q_rope | q_abs] (Q_MAP) or expanded
+    // [q_rope | q_res | q_nope] (Q_EXP)
+    auto map_query = [&](ggml_tensor * qmap) {
+        ggml_tensor * qq = ggml_mul_mat(ctx0, qmap, qh);                                     // [rd + rest, T, H]
+        ggml_tensor * q_rope = ggml_view_3d(ctx0, qq, rd, T, H, qq->nb[1], qq->nb[2], 0);
+        ggml_tensor * q_rest = ggml_view_3d(ctx0, qq, qq->ne[0] - rd, T, H, qq->nb[1], qq->nb[2], rd * ggml_element_size(qq));
+        q_rope = ggml_cont(ctx0, ggml_permute(ctx0, q_rope, 0, 2, 1, 3));                  // [rd, H, T] for rope
+        q_rope = ggml_rope_ext(ctx0, q_rope, inp_pos, nullptr, rd, LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
+                               ext_factor, attn_factor, beta_fast, beta_slow);
+        q_rope = ggml_cont(ctx0, ggml_permute(ctx0, q_rope, 0, 2, 1, 3));                  // [rd, T, H]
+        return ggml_concat(ctx0, q_rope, ggml_cont(ctx0, q_rest), 0);
+    };
 
     // this step's cache entries: RoPE key and latent (rotations folded), per-group key rms
     ggml_tensor * kr = ggml_mul_mat(ctx0, layer.merc_k_rope, cur);                         // [rd, T]
@@ -326,37 +335,81 @@ ggml_tensor * llama_model_mercurius::graph::build_layer_attn(llm_graph_input_att
 
     const int words = hparams.merc_cache_words[il];
     ggml_tensor * packed = ggml_merc_tq_pack(ctx0, c, kr, rms, inp_pos, layer.merc_tq_latent_cb, layer.merc_tq_rope_cb, words);
-    ggml_build_forward_expand(gf, q_full);
     ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, ggml_reshape_3d(ctx0, packed, words, 1, T), inp->get_k_idxs(), il));
 
     // decode the layer's cache (past + this step)
     ggml_tensor * kc = mctx_cur->get_k(ctx0, il);                                           // [words, 1, n_kv, ns]
     GGML_ASSERT(kc->ne[3] == 1 && "mercurius: one KV stream");
     const int64_t n_kv = kc->ne[2];
-    ggml_tensor * dec = ggml_merc_tq_unpack(ctx0, kc, layer.merc_tq_latent_cb, layer.merc_tq_rope_cb, r, rd, G, 0);
-    ggml_tensor * pos = ggml_merc_tq_unpack(ctx0, kc, layer.merc_tq_latent_cb, layer.merc_tq_rope_cb, r, rd, G, 1);
-    ggml_tensor * c_all  = ggml_view_2d(ctx0, dec, r,  n_kv, dec->nb[1], 0);
-    ggml_tensor * kt_all = ggml_view_2d(ctx0, dec, rd, n_kv, dec->nb[1], r * sizeof(float));
-    ggml_tensor * rms_all = ggml_view_2d(ctx0, dec, G, n_kv, dec->nb[1], (r + rd) * sizeof(float));
+    const bool plain_rope = freq_scale == 1.0f && ext_factor == 0.0f && attn_factor == 1.0f;
+    // prefill: expanded per-group K / V (f16) + flash attention (absorbed attention costs ~1.7x more per pair once the
+    // expansion is shared by more than ~140 queries); decode and short batches: the fused absorbed kernel
+    if (T > 8 && cparams.flash_attn && layer.merc_q_exp && layer.merc_k_up && n_kv % 256 == 0 && plain_rope) {
+        ggml_tensor * qe = map_query(layer.merc_q_exp);                                    // [Ek, T, H]
+        const int64_t Ek = qe->ne[0];
+        ggml_tensor * kv = ggml_merc_tq_expand(ctx0, kc, layer.merc_tq_latent_cb, layer.merc_tq_rope_cb,
+                                               layer.merc_rope_unrot, layer.merc_k_up, layer.merc_v_up, r, rd, G, freq_base);
+        ggml_tensor * Kx = ggml_view_3d(ctx0, kv, Ek, n_kv, G, kv->nb[1], Ek * ggml_element_size(kv), 0);
+        ggml_tensor * Vx = ggml_view_3d(ctx0, kv, D, n_kv, G, kv->nb[1], D * ggml_element_size(kv), Ek * G * ggml_element_size(kv));
+        ggml_tensor * fa = ggml_flash_attn_ext(ctx0, qe, Kx, Vx, inp->get_kq_mask(), hparams.f_attention_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        ggml_tensor * o = ggml_reshape_2d(ctx0, fa, D * H, T);                              // fa: [D, H, T]
+        o = ggml_mul(ctx0, o, ggml_sigmoid(ctx0, gate));
+        cur = ggml_mul_mat(ctx0, layer.wo, o);
+        cb(cur, "attn_output", il);
+        return cur;
+    }
+    ggml_tensor * q_full = map_query(layer.merc_q_map);                                    // [rd + r, T, H]
+    ggml_tensor * o_lat;
+    if (H == 16 && rd % 16 == 0 && plain_rope) {
+        // one fused op reads the packed cache (decode: straight from the codes; prefill: one f16 decode + flash)
+        o_lat = ggml_merc_tq_attn(ctx0, q_full, kc, layer.merc_tq_latent_cb, layer.merc_tq_rope_cb,
+                                  layer.merc_rope_unrot, inp->get_kq_mask(), r, rd, G, hparams.f_attention_scale, freq_base);
+    } else {
+        ggml_tensor * dec = ggml_merc_tq_unpack(ctx0, kc, layer.merc_tq_latent_cb, layer.merc_tq_rope_cb, r, rd, G, 0);
+        ggml_tensor * pos = ggml_merc_tq_unpack(ctx0, kc, layer.merc_tq_latent_cb, layer.merc_tq_rope_cb, r, rd, G, 1);
+        ggml_tensor * c_all  = ggml_view_2d(ctx0, dec, r,  n_kv, dec->nb[1], 0);
+        ggml_tensor * kt_all = ggml_view_2d(ctx0, dec, rd, n_kv, dec->nb[1], r * sizeof(float));
+        ggml_tensor * rms_all = ggml_view_2d(ctx0, dec, G, n_kv, dec->nb[1], (r + rd) * sizeof(float));
 
-    ggml_tensor * kt = ggml_mul_mat(ctx0, layer.merc_rope_unrot, kt_all);                  // R0^T, [rd, n_kv]
-    kt = ggml_reshape_3d(ctx0, kt, rd, 1, n_kv);
-    kt = ggml_rope_ext(ctx0, kt, pos, nullptr, rd, LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
-                       ext_factor, attn_factor, beta_fast, beta_slow);
-    ggml_tensor * k_full = ggml_concat(ctx0, ggml_reshape_2d(ctx0, kt, rd, n_kv), ggml_cont(ctx0, c_all), 0);   // [rd + r, n_kv]
+        ggml_tensor * kt = ggml_mul_mat(ctx0, layer.merc_rope_unrot, kt_all);                  // R0^T, [rd, n_kv]
+        kt = ggml_reshape_3d(ctx0, kt, rd, 1, n_kv);
+        kt = ggml_rope_ext(ctx0, kt, pos, nullptr, rd, LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
+                           ext_factor, attn_factor, beta_fast, beta_slow);
+        ggml_tensor * k_full = ggml_concat(ctx0, ggml_reshape_2d(ctx0, kt, rd, n_kv), ggml_cont(ctx0, c_all), 0);   // [rd + r, n_kv]
 
-    ggml_tensor * kq = ggml_mul_mat(ctx0, k_full, q_full);                                 // [n_kv, T, H]
-    kq = ggml_reshape_4d(ctx0, kq, n_kv, T, rep, G);                                       // head h = j + rep*g
-    ggml_tensor * rms_t = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, rms_all)), n_kv, 1, 1, G);
-    // unwritten cells of the KV window decode to rms 0: keep their (masked) scores finite instead of 0/0
-    rms_t = ggml_clamp(ctx0, rms_t, 1e-6f, INFINITY);
-    kq = ggml_div(ctx0, kq, rms_t);                                                        // per-group key normaliser
-    kq = ggml_reshape_3d(ctx0, kq, n_kv, T, H);
-    kq = ggml_soft_max_ext(ctx0, kq, inp->get_kq_mask(), hparams.f_attention_scale, 0.0f);
-    cb(kq, "kq_soft_max", il);
-
-    ggml_tensor * c_t = ggml_cont(ctx0, ggml_transpose(ctx0, c_all));                      // [n_kv, r]
-    ggml_tensor * o_lat = ggml_mul_mat(ctx0, c_t, kq);                                     // [r, T, H]
+        ggml_tensor * rms_t = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, rms_all)), n_kv, 1, 1, G);
+        // unwritten cells of the KV window decode to rms 0: keep their (masked) scores finite instead of 0/0
+        rms_t = ggml_clamp(ctx0, rms_t, 1e-6f, INFINITY);
+        ggml_tensor * c_t = ggml_cont(ctx0, ggml_transpose(ctx0, c_all));                      // [n_kv, r]
+        ggml_tensor * kq_mask = inp->get_kq_mask();
+        // queries in sub-batches: the score matrix exists for QB queries at a time (n_kv x QB x H), not the whole
+        // ubatch, and the allocator reuses it across sub-batches (compute buffer ~8x smaller at a 512 ubatch)
+        const int64_t QB = 64;
+        std::vector<ggml_tensor *> parts;
+        for (int64_t a = 0; a < T; a += QB) {
+            const int64_t tb = std::min(QB, T - a);
+            ggml_tensor * qs = ggml_view_3d(ctx0, q_full, q_full->ne[0], tb, H, q_full->nb[1], q_full->nb[2],
+                                            a * q_full->nb[1]);
+            ggml_tensor * kq = ggml_mul_mat(ctx0, k_full, qs);                                 // [n_kv, tb, H]
+            kq = ggml_reshape_4d(ctx0, kq, n_kv, tb, rep, G);                                  // head h = j + rep*g
+            kq = ggml_div(ctx0, kq, rms_t);                                                    // per-group key normaliser
+            kq = ggml_reshape_3d(ctx0, kq, n_kv, tb, H);
+            ggml_tensor * m = ggml_view_2d(ctx0, kq_mask, kq_mask->ne[0], tb, kq_mask->nb[1], a * kq_mask->nb[1]);
+            kq = ggml_soft_max_ext(ctx0, kq, m, hparams.f_attention_scale, 0.0f);
+            cb(kq, "kq_soft_max", il);
+            ggml_tensor * o = ggml_mul_mat(ctx0, c_t, kq);                                     // [r, tb, H]
+            parts.push_back(o);
+        }
+        while (parts.size() > 1) {                                                             // balanced concat tree
+            std::vector<ggml_tensor *> next;
+            for (size_t i = 0; i < parts.size(); i += 2) {
+                next.push_back(i + 1 < parts.size() ? ggml_concat(ctx0, parts[i], parts[i + 1], 1) : parts[i]);
+            }
+            parts.swap(next);
+        }
+        o_lat = parts[0];
+    }
     o_lat = ggml_reshape_4d(ctx0, o_lat, r, T, rep, G);
     ggml_tensor * wv = ggml_reshape_4d(ctx0, layer.merc_v_up, r, D, 1, G);
     ggml_tensor * o = ggml_mul_mat(ctx0, wv, o_lat);                                       // [D, T, rep, G]

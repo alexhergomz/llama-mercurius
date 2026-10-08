@@ -1317,20 +1317,26 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
 
 static __device__ __forceinline__ float vec_dot_nf4_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    // NF4 levels as int16 (level * 32767) looked up with byte permutes (low/high byte tables), int16 x int8 dot
+    // products (dp2a). NF4 packs element 2k in the low and 2k+1 in the high nibble of byte k, so the activations
+    // are split into even / odd elements to match.
     const block_nf4  * b = (const block_nf4 *) vbq + kbx;
     const block_q8_1 * y = bq8_1 + iqs/4;
     const int8_t * q8 = (const int8_t *) y->qs + 8*(iqs % 4);
-    float sum = 0.0f;
+    int sumi = 0;
 #pragma unroll
     for (int l = 0; l < VDR_NF4_Q8_1_MMVQ; ++l) {
-        const uint32_t aux = (uint32_t) get_int_b4(b->qs, iqs + l);
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const uint32_t c = (aux >> (8*k)) & 0xff;
-            sum += kvalues_nf4[c & 0xf] * q8[8*l + 2*k] + kvalues_nf4[c >> 4] * q8[8*l + 2*k + 1];
-        }
+        const int aux = get_int_b4(b->qs, iqs + l);
+        const int2 vl = get_int_from_table_16(aux, kvalues_nf4_lo);    // x: elements 0,2,4,6  y: 1,3,5,7
+        const int2 vh = get_int_from_table_16(aux, kvalues_nf4_hi);
+        const int qa = get_int_b4(q8, 2*l), qb = get_int_b4(q8, 2*l + 1);
+        const int q_even = (int) __byte_perm(qa, qb, 0x6420), q_odd = (int) __byte_perm(qa, qb, 0x7531);
+        sumi = __dp2a_lo((int) __byte_perm(vl.x, vh.x, 0x5140), q_even, sumi);
+        sumi = __dp2a_hi((int) __byte_perm(vl.x, vh.x, 0x7362), q_even, sumi);
+        sumi = __dp2a_lo((int) __byte_perm(vl.y, vh.y, 0x5140), q_odd,  sumi);
+        sumi = __dp2a_hi((int) __byte_perm(vl.y, vh.y, 0x7362), q_odd,  sumi);
     }
-    return sum * b->d * __low2float(y->ds);
+    return (float) sumi * (b->d * (1.0f / 32767.0f)) * __low2float(y->ds);
 }
 
 #define VDR_IQ4_NL_Q8_1_MMVQ 2

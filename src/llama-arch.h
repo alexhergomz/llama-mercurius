@@ -519,20 +519,16 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_ROPE_UNROT,     // mercurius: R0^T for the RoPE key
     LLM_TENSOR_ATTN_LATENT,         // mercurius: MLA latent down-projection (rotation folded)
     LLM_TENSOR_ATTN_V_UP,           // mercurius: per-group value up-projection from the latent
+    LLM_TENSOR_ATTN_Q_EXP,          // mercurius: expanded-form query map per head (prefill)
+    LLM_TENSOR_ATTN_K_UP,           // mercurius: latent -> expanded key features (prefill)
     LLM_TENSOR_ATTN_K_RMS,          // mercurius: original key projection for the per-group 1/rms
     LLM_TENSOR_ATTN_TQ_LATENT_CB,   // mercurius: TurboQuant codebook (16 centroids + 15 bounds) of the latent
     LLM_TENSOR_ATTN_TQ_ROPE_CB,     // mercurius: TurboQuant codebook of the RoPE key
     LLM_TENSOR_SSM_A_LORA_A,        // mercurius: decay LoRA
     LLM_TENSOR_SSM_A_LORA_B,
-    LLM_TENSOR_GATE_A_BASE,         // mercurius: factored GDN-2 gates (tiled base rows + VeRA vectors)
-    LLM_TENSOR_GATE_A_VD,
-    LLM_TENSOR_GATE_A_VB,
-    LLM_TENSOR_GATE_BE_BASE,
-    LLM_TENSOR_GATE_BE_VD,
-    LLM_TENSOR_GATE_BE_VB,
-    LLM_TENSOR_GATE_BW_BASE,
-    LLM_TENSOR_GATE_BW_VD,
-    LLM_TENSOR_GATE_BW_VB,
+    LLM_TENSOR_GATE_BASE,           // mercurius: factored GDN-2 gates, stacked [decay a, erase be, write bw]
+    LLM_TENSOR_GATE_VD,
+    LLM_TENSOR_GATE_VB,
     LLM_TENSOR_VERA_A,              // mercurius: VeRA factors shared by every gate
     LLM_TENSOR_VERA_B,
     LLM_TENSOR_SSM_F_A,             // kimi: forget gate projection A

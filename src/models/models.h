@@ -2089,7 +2089,7 @@ struct llama_model_mercurius : public llama_model_base {
     private:
         ggml_tensor * build_layer_attn(llm_graph_input_attn_kv * inp_attn, ggml_tensor * cur, ggml_tensor * inp_pos, int il);
         ggml_tensor * build_layer_attn_linear(llm_graph_input_rs * inp, ggml_tensor * cur, int il);
-        ggml_tensor * build_gate(ggml_tensor * cur, ggml_tensor * vera_u, int g, int il);
+        ggml_tensor * build_gates(ggml_tensor * cur, int il);
         const llama_model & model;
     };
 

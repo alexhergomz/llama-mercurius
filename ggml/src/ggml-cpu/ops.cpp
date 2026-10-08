@@ -11433,6 +11433,139 @@ void ggml_compute_forward_merc_tq_unpack(const ggml_compute_params * params, ggm
     }
 }
 
+void ggml_compute_forward_merc_tq_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+    // reference: decode every cell once per query token, then the same score/softmax/sum as the CUDA kernel
+    const ggml_tensor * q = dst->src[0], * pk = dst->src[1], * un = dst->src[4], * mask = dst->src[5];
+    const float * cbl = (const float *) dst->src[2]->data;
+    const float * cbr = (const float *) dst->src[3]->data;
+    const int r = ggml_get_op_params_i32(dst, 0), rd = ggml_get_op_params_i32(dst, 1), G = ggml_get_op_params_i32(dst, 2);
+    const float scale = ggml_get_op_params_f32(dst, 3), freq_base = ggml_get_op_params_f32(dst, 4);
+    const int64_t T = q->ne[1], H = q->ne[2], E = rd + r;
+    const int64_t n_kv = pk->ne[1] * pk->ne[2];
+    const size_t nb_cell = pk->ne[1] == 1 ? pk->nb[2] : pk->nb[1];
+    const int rep = (int) (H / G);
+    const float theta_scale = powf(freq_base, -2.0f / rd);
+    float * wk = (float *) params->wdata + params->ith * (n_kv * (E + 1) + H * n_kv);   // k_full[n_kv][E], rms
+    float * sc = wk + n_kv * (E + 1);
+    std::vector<float> raw(rd), U((size_t) rd * rd);
+    for (int i = 0; i < rd * rd; ++i) {
+        U[i] = un->type == GGML_TYPE_F32 ? ((const float *) un->data)[i] : GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) un->data)[i]);
+    }
+    for (int64_t t = params->ith; t < T; t += params->nth) {
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const uint8_t * row = (const uint8_t *) pk->data + j * nb_cell;
+            int32_t pos; memcpy(&pos, row, 4);
+            ggml_fp16_t nl, nr;
+            memcpy(&nl, row + 4 + 4 * G, 2);
+            memcpy(&nr, row + 4 + 4 * G + 2, 2);
+            const uint8_t * rope_codes = row + 4 + 4 * G + 4;
+            float * k = wk + j * (E + 1);
+            merc_tq_decode(rope_codes, nr, rd, cbr, raw.data());
+            merc_tq_decode(rope_codes + rd / 2, nl, r, cbl, k + rd);
+            for (int i = 0; i < rd / 2; ++i) {
+                float x0 = 0.0f, x1 = 0.0f;
+                for (int kk = 0; kk < rd; ++kk) {
+                    x0 += U[(size_t) i * rd + kk] * raw[kk];
+                    x1 += U[(size_t) (i + rd / 2) * rd + kk] * raw[kk];
+                }
+                const float th = (float) pos * powf(theta_scale, (float) i);
+                const float cs = cosf(th), sn = sinf(th);
+                k[i] = x0 * cs - x1 * sn;
+                k[i + rd / 2] = x0 * sn + x1 * cs;
+            }
+            memcpy(k + E, row + 4, 4);        // placeholder slot (rms read per group below)
+        }
+        for (int64_t h = 0; h < H; ++h) {
+            const float * qh = (const float *) ((const char *) q->data + t * q->nb[1] + h * q->nb[2]);
+            const int g = (int) (h / rep);
+            float mx = -INFINITY;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const uint8_t * row = (const uint8_t *) pk->data + j * nb_cell;
+                float rms; memcpy(&rms, row + 4 + 4 * g, 4);
+                const float * k = wk + j * (E + 1);
+                float d = 0.0f;
+                for (int e = 0; e < E; ++e) d += qh[e] * k[e];
+                float m = 0.0f;
+                if (mask) {
+                    const char * mp = (const char *) mask->data + t * mask->nb[1];
+                    m = mask->type == GGML_TYPE_F32 ? ((const float *) mp)[j] : GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mp)[j]);
+                }
+                const float s = d / (rms > 1e-6f ? rms : 1e-6f) * scale + m;
+                sc[h * n_kv + j] = s;
+                mx = s > mx ? s : mx;
+            }
+            float * o = (float *) ((char *) dst->data + t * dst->nb[1] + h * dst->nb[2]);
+            for (int e = 0; e < r; ++e) o[e] = 0.0f;
+            if (mx == -INFINITY) continue;
+            float l = 0.0f;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const float p = expf(sc[h * n_kv + j] - mx);
+                l += p;
+                const float * c = wk + j * (E + 1) + rd;
+                for (int e = 0; e < r; ++e) o[e] += p * c[e];
+            }
+            for (int e = 0; e < r; ++e) o[e] /= l;
+        }
+    }
+}
+
+void ggml_compute_forward_merc_tq_expand(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * pk = dst->src[0], * un = dst->src[3], * ku = dst->src[4], * vu = dst->src[5];
+    const float * cbl = (const float *) dst->src[1]->data;
+    const float * cbr = (const float *) dst->src[2]->data;
+    const int r = ggml_get_op_params_i32(dst, 0), rd = ggml_get_op_params_i32(dst, 1), G = ggml_get_op_params_i32(dst, 2);
+    const float freq_base = ggml_get_op_params_f32(dst, 3);
+    const int D = (int) vu->ne[1], nres = (G - 1) * rd, nope = D - rd, Ek = rd + nres + nope;
+    const int64_t n_kv = pk->ne[1] * pk->ne[2];
+    const size_t nb_cell = pk->ne[1] == 1 ? pk->nb[2] : pk->nb[1];
+    const float theta_scale = powf(freq_base, -2.0f / rd);
+    auto wget = [](const ggml_tensor * t, int64_t i) {
+        return t->type == GGML_TYPE_F32 ? ((const float *) t->data)[i] : GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) t->data)[i]);
+    };
+    std::vector<float> raw(rd), c(r), kt(rd), kn(nres + G * nope), vv((size_t) D * G);
+    for (int64_t j = params->ith; j < n_kv; j += params->nth) {
+        const uint8_t * row = (const uint8_t *) pk->data + j * nb_cell;
+        int32_t pos; memcpy(&pos, row, 4);
+        ggml_fp16_t nl, nr;
+        memcpy(&nl, row + 4 + 4 * G, 2);
+        memcpy(&nr, row + 4 + 4 * G + 2, 2);
+        const uint8_t * rope_codes = row + 4 + 4 * G + 4;
+        merc_tq_decode(rope_codes, nr, rd, cbr, raw.data());
+        merc_tq_decode(rope_codes + rd / 2, nl, r, cbl, c.data());
+        for (int i = 0; i < rd / 2; ++i) {
+            float x0 = 0.0f, x1 = 0.0f;
+            for (int k = 0; k < rd; ++k) {
+                x0 += wget(un, (int64_t) i * rd + k) * raw[k];
+                x1 += wget(un, (int64_t) (i + rd / 2) * rd + k) * raw[k];
+            }
+            const float th = (float) pos * powf(theta_scale, (float) i);
+            kt[i] = x0 * cosf(th) - x1 * sinf(th);
+            kt[i + rd / 2] = x0 * sinf(th) + x1 * cosf(th);
+        }
+        for (int o = 0; o < nres + G * nope; ++o) {
+            float acc = 0.0f;
+            for (int e = 0; e < r; ++e) acc += wget(ku, (int64_t) o * r + e) * c[e];
+            kn[o] = acc;
+        }
+        for (int o = 0; o < D * G; ++o) {
+            float acc = 0.0f;
+            for (int e = 0; e < r; ++e) acc += wget(vu, (int64_t) o * r + e) * c[e];
+            vv[o] = acc;
+        }
+        ggml_fp16_t * y = (ggml_fp16_t *) ((char *) dst->data + j * dst->nb[1]);
+        for (int g = 0; g < G; ++g) {
+            float rms; memcpy(&rms, row + 4 + 4 * g, 4);
+            const float inv = 1.0f / (rms > 1e-6f ? rms : 1e-6f);
+            ggml_fp16_t * k = y + (int64_t) g * Ek;
+            for (int i = 0; i < rd; ++i)   k[i]              = GGML_CPU_FP32_TO_FP16(kt[i] * inv);
+            for (int i = 0; i < nres; ++i) k[rd + i]         = GGML_CPU_FP32_TO_FP16(kn[i] * inv);
+            for (int i = 0; i < nope; ++i) k[rd + nres + i]  = GGML_CPU_FP32_TO_FP16(kn[nres + g * nope + i] * inv);
+            ggml_fp16_t * v = y + (int64_t) G * Ek + (int64_t) g * D;
+            for (int i = 0; i < D; ++i) v[i] = GGML_CPU_FP32_TO_FP16(vv[(int64_t) g * D + i]);
+        }
+    }
+}
+
 // ggml_compute_forward_turbo_wht
 
 // WHT sign arrays (must match Metal shader turbo_wht_signs1/2)

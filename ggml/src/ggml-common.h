@@ -1243,6 +1243,15 @@ GGML_TABLE_BEGIN(float, kvalues_nf4, 16)
     0.24611230194568634f, 0.33791524171829224f, 0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f,
 GGML_TABLE_END()
 
+// NF4 levels as int16 (round(level * 32767), |error| <= 1.5e-5), split into low/high bytes for byte-permute lookups
+GGML_TABLE_BEGIN(int8_t, kvalues_nf4_lo, 16)
+    1, -28, -53, 116, -104, 90, 89, 0, 48, -103, -128, 64, 105, 3, -119, -1,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(int8_t, kvalues_nf4_hi, 16)
+    -128, -90, -68, -51, -37, -24, -12, 0, 10, 20, 31, 43, 56, 72, 92, 127,
+GGML_TABLE_END()
+
 GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 GGML_TABLE_END()

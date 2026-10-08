@@ -2320,6 +2320,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_merc_tq_unpack(params, tensor);
             } break;
+        case GGML_OP_MERC_TQ_ATTN:
+            {
+                ggml_compute_forward_merc_tq_attn(params, tensor);
+            } break;
+        case GGML_OP_MERC_TQ_EXPAND:
+            {
+                ggml_compute_forward_merc_tq_expand(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2519,6 +2527,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TURBO_WHT:
         case GGML_OP_MERC_TQ_PACK:
         case GGML_OP_MERC_TQ_UNPACK:
+        case GGML_OP_MERC_TQ_ATTN:
+        case GGML_OP_MERC_TQ_EXPAND:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -3260,6 +3270,16 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_MERC_TQ_UNPACK:
                     {
                         cur = 0;
+                    } break;
+                case GGML_OP_MERC_TQ_EXPAND:
+                    {
+                        cur = 0;
+                    } break;
+                case GGML_OP_MERC_TQ_ATTN:
+                    {
+                        const int64_t n_kv = node->src[1]->ne[1] * node->src[1]->ne[2];
+                        const int64_t E = node->src[0]->ne[0], H = node->src[0]->ne[2];
+                        cur = sizeof(float) * (n_kv * (E + 1) + H * n_kv) * n_tasks;   // decoded cells + scores
                     } break;
                 case GGML_OP_TURBO_WHT:
                     {

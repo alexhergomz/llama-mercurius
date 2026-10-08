@@ -2701,6 +2701,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<320, 256, 32>(ctx, dst);
             }
             break;
+        case 448:
+            // Mercurius-1-4B expanded MLA prefill: 16 query heads over 4 KV groups
+            GGML_ASSERT(V->ne[0] == 256);
+            GGML_ASSERT(Q->ne[2] % K->ne[2] == 0 && (Q->ne[2] / K->ne[2]) % 4 == 0);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<448, 256, 4>(ctx, dst);
+            break;
         case 512:
             GGML_ASSERT(V->ne[0] == 512);
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);
@@ -3030,6 +3036,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             if (gqa_ratio % 32 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            break;
+        case 448:
+            if (V->ne[0] != 256 || !gqa_opt_applies || gqa_ratio % 4 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            if (!turing_mma_available(cc)) {            // MMA-only head size (no tile/vec instances)
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;

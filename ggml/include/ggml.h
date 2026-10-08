@@ -585,6 +585,8 @@ extern "C" {
         GGML_OP_TURBO_WHT,
         GGML_OP_MERC_TQ_PACK,
         GGML_OP_MERC_TQ_UNPACK,
+        GGML_OP_MERC_TQ_ATTN,
+        GGML_OP_MERC_TQ_EXPAND,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2664,6 +2666,42 @@ extern "C" {
             int                   rd,
             int                   G,
             int                   mode);
+
+    // Mercurius absorbed-MLA attention straight from the packed TurboQuant cache (decode: few query tokens).
+    // q: [rd + r, T, H] f32 = [roped q_rope | q_abs]; packed: the layer's cache view [words, 1, n_kv];
+    // rope_unrot: [rd, rd]; mask: [n_kv, >= T] (f16 or f32). Per cell: k = [rope_neox(R0^T k_rope, pos) | c],
+    // score = (q . k) / max(rms_g, 1e-6) * scale + mask, softmax over cells, out = sum p c.  Returns [r, T, H] f32.
+    // RoPE: theta = pos * freq_base^(-2i/rd), no scaling (freq_scale 1, ext_factor 0, attn_factor 1).
+    GGML_API struct ggml_tensor * ggml_merc_tq_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * packed,
+            struct ggml_tensor  * cb_latent,
+            struct ggml_tensor  * cb_rope,
+            struct ggml_tensor  * rope_unrot,
+            struct ggml_tensor  * mask,
+            int                   r,
+            int                   rd,
+            int                   G,
+            float                 scale,
+            float                 freq_base);
+
+    // Mercurius expanded-form keys/values for prefill attention, from the packed cache: per cell and group
+    // K_g = [rope_neox(R0^T k_rope, pos) | k_up[:nres] c | k_up[nres + g*nope : +nope] c] / max(rms_g, 1e-6),
+    // V_g = v_up_g c. k_up: [r, nres + G*nope], v_up: [r, D, G] (f16 or f32). Returns F16 [Ek*G + D*G, n_kv] with
+    // Ek = rd + nres + nope; K = view [Ek, n_kv, G] (nb2 = Ek*2), V = view [D, n_kv, G] at offset Ek*G*2.
+    GGML_API struct ggml_tensor * ggml_merc_tq_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * packed,
+            struct ggml_tensor  * cb_latent,
+            struct ggml_tensor  * cb_rope,
+            struct ggml_tensor  * rope_unrot,
+            struct ggml_tensor  * k_up,
+            struct ggml_tensor  * v_up,
+            int                   r,
+            int                   rd,
+            int                   G,
+            float                 freq_base);
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(

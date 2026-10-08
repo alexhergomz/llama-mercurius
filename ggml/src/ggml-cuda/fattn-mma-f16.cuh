@@ -76,6 +76,11 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  32, 128, 128, 128, 1, false);
+    // Mercurius expanded MLA prefill (K = 64 rope + 192 shared + 192 per group, V = 256), GQA 4
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256,  8,  64, 4,  32, 224, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 16,  64, 4,  32, 224, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 32, 128, 2,  32, 112, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 64, 128, 2,  32, 112, 128, 128, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32, 256, 256, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 256, 256, 128, 1, false);
@@ -103,6 +108,11 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  32, 128, 128, 128, 1, false);
+    // Mercurius expanded MLA prefill (K = 64 rope + 192 shared + 192 per group, V = 256), GQA 4
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256,  8,  64, 4,  32, 224, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 16,  64, 4,  32, 224, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 32, 128, 2,  32, 112, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 64, 256, 1,  32, 112, 128, 128, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32,  96,  64, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32,  96,  64, 128, 1, false);
@@ -180,6 +190,11 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
+    // Mercurius expanded MLA prefill (K = 64 rope + 192 shared + 192 per group, V = 256), GQA 4
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256,  8,  64, 4,  32, 224, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 16,  64, 4,  32, 224, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 32, 128, 2,  32, 112, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 64, 256, 1,  32, 112, 128, 128, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
@@ -241,6 +256,11 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 256, 1,  64, 160, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  64, 160, 128, 128, 1, true);
+    // Mercurius expanded MLA prefill (K = 64 rope + 192 shared + 192 per group, V = 256), GQA 4
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256,  8,  64, 4,  32, 224, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 16,  64, 4,  32, 224, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 32, 128, 2,  32, 112, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(448, 256, 64, 256, 1,  32, 112, 128, 128, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 256, 1,  64, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 256, 1,  64, 128, 128, 128, 1, true);
@@ -2450,6 +2470,12 @@ extern DECL_FATTN_MMA_F16_CASE(576, 512, 4, 16);
 // Mistral Small 4 (DKQ=320, DV=256), GQA=32-only build:
 extern DECL_FATTN_MMA_F16_CASE(320, 256,  1, 32);
 extern DECL_FATTN_MMA_F16_CASE(320, 256,  2, 32);
+
+// Mercurius expanded MLA prefill (DKQ=448, DV=256), GQA=4
+extern DECL_FATTN_MMA_F16_CASE(448, 256,  2,  4);
+extern DECL_FATTN_MMA_F16_CASE(448, 256,  4,  4);
+extern DECL_FATTN_MMA_F16_CASE(448, 256,  8,  4);
+extern DECL_FATTN_MMA_F16_CASE(448, 256, 16,  4);
 
 // For GLM 4.7 Flash
 extern DECL_FATTN_MMA_F16_CASE(576, 512,  4,  4);

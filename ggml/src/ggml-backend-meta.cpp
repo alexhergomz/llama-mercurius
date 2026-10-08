@@ -1043,7 +1043,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_MERC_TQ_PACK:
-            case GGML_OP_MERC_TQ_UNPACK: {
+            case GGML_OP_MERC_TQ_UNPACK:
+            case GGML_OP_MERC_TQ_ATTN:
+            case GGML_OP_MERC_TQ_EXPAND: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             default: {

@@ -1154,6 +1154,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "TURBO_WHT",
     "MERC_TQ_PACK",
     "MERC_TQ_UNPACK",
+    "MERC_TQ_ATTN",
+    "MERC_TQ_EXPAND",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
@@ -1175,7 +1177,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1272,6 +1274,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "turbo_wht(a)",
     "merc_tq_pack(c,kr,inv_r,pos)",
     "merc_tq_unpack(x)",
+    "merc_tq_attn(q,k)",
+    "merc_tq_expand(k)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -1293,7 +1297,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6482,6 +6486,85 @@ struct ggml_tensor * ggml_merc_tq_unpack(
     result->src[0] = packed;
     result->src[1] = cb_latent;
     result->src[2] = cb_rope;
+    return result;
+}
+
+struct ggml_tensor * ggml_merc_tq_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * cb_latent,
+        struct ggml_tensor  * cb_rope,
+        struct ggml_tensor  * rope_unrot,
+        struct ggml_tensor  * mask,
+        int                   r,
+        int                   rd,
+        int                   G,
+        float                 scale,
+        float                 freq_base) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q) && q->ne[0] == rd + r);
+    GGML_ASSERT(packed->type == GGML_TYPE_F32 && packed->nb[0] == sizeof(float));
+    GGML_ASSERT(4*packed->ne[0] >= ggml_merc_tq_row_bytes(r, rd, G));
+    GGML_ASSERT(ggml_nelements(cb_latent) == 31 && ggml_nelements(cb_rope) == 31);
+    GGML_ASSERT(rope_unrot->type == GGML_TYPE_F32 || rope_unrot->type == GGML_TYPE_F16);
+    GGML_ASSERT(rope_unrot->ne[0] == rd && rope_unrot->ne[1] == rd && ggml_is_contiguous(rope_unrot));
+    GGML_ASSERT(rd % 2 == 0 && q->ne[2] % G == 0);
+    const int64_t n_kv = packed->ne[1] * packed->ne[2];
+    GGML_ASSERT(packed->ne[1] == 1 || packed->ne[2] == 1);
+    GGML_ASSERT(mask == NULL || ((mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) &&
+                                 mask->ne[0] >= n_kv && mask->ne[1] >= q->ne[1]));
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, r, q->ne[1], q->ne[2]);
+    ggml_set_op_params_i32(result, 0, r);
+    ggml_set_op_params_i32(result, 1, rd);
+    ggml_set_op_params_i32(result, 2, G);
+    ggml_set_op_params_f32(result, 3, scale);
+    ggml_set_op_params_f32(result, 4, freq_base);
+    result->op     = GGML_OP_MERC_TQ_ATTN;
+    result->src[0] = q;
+    result->src[1] = packed;
+    result->src[2] = cb_latent;
+    result->src[3] = cb_rope;
+    result->src[4] = rope_unrot;
+    result->src[5] = mask;
+    return result;
+}
+
+struct ggml_tensor * ggml_merc_tq_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * cb_latent,
+        struct ggml_tensor  * cb_rope,
+        struct ggml_tensor  * rope_unrot,
+        struct ggml_tensor  * k_up,
+        struct ggml_tensor  * v_up,
+        int                   r,
+        int                   rd,
+        int                   G,
+        float                 freq_base) {
+    GGML_ASSERT(packed->type == GGML_TYPE_F32 && packed->nb[0] == sizeof(float));
+    GGML_ASSERT(4*packed->ne[0] >= ggml_merc_tq_row_bytes(r, rd, G));
+    GGML_ASSERT(packed->ne[1] == 1 || packed->ne[2] == 1);
+    GGML_ASSERT(ggml_nelements(cb_latent) == 31 && ggml_nelements(cb_rope) == 31);
+    GGML_ASSERT(rope_unrot->ne[0] == rd && rope_unrot->ne[1] == rd && ggml_is_contiguous(rope_unrot));
+    GGML_ASSERT(k_up->ne[0] == r && ggml_is_contiguous(k_up) && (k_up->type == GGML_TYPE_F16 || k_up->type == GGML_TYPE_F32));
+    GGML_ASSERT(v_up->ne[0] == r && v_up->ne[2] == G && ggml_is_contiguous(v_up) && (v_up->type == GGML_TYPE_F16 || v_up->type == GGML_TYPE_F32));
+    const int D = (int) v_up->ne[1];
+    const int nres = (G - 1) * rd, nope = D - rd;
+    GGML_ASSERT(k_up->ne[1] == nres + G * nope);
+    const int64_t n_kv = packed->ne[1] * packed->ne[2];
+    const int Ek = rd + nres + nope;
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, (int64_t) Ek * G + (int64_t) D * G, n_kv);
+    ggml_set_op_params_i32(result, 0, r);
+    ggml_set_op_params_i32(result, 1, rd);
+    ggml_set_op_params_i32(result, 2, G);
+    ggml_set_op_params_f32(result, 3, freq_base);
+    result->op     = GGML_OP_MERC_TQ_EXPAND;
+    result->src[0] = packed;
+    result->src[1] = cb_latent;
+    result->src[2] = cb_rope;
+    result->src[3] = rope_unrot;
+    result->src[4] = k_up;
+    result->src[5] = v_up;
     return result;
 }
 

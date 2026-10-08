@@ -454,14 +454,16 @@ struct llama_layer {
     struct ggml_tensor * merc_rope_unrot   = nullptr;
     struct ggml_tensor * merc_latent       = nullptr;
     struct ggml_tensor * merc_v_up         = nullptr;
+    struct ggml_tensor * merc_q_exp        = nullptr;   // optional: expanded prefill path
+    struct ggml_tensor * merc_k_up         = nullptr;
     struct ggml_tensor * merc_k_rms        = nullptr;
     struct ggml_tensor * merc_tq_latent_cb = nullptr;
     struct ggml_tensor * merc_tq_rope_cb   = nullptr;
     struct ggml_tensor * merc_a_lora_a     = nullptr;
     struct ggml_tensor * merc_a_lora_b     = nullptr;
-    struct ggml_tensor * merc_gate_base[3] = {};   // a (decay), be (erase), bw (write)
-    struct ggml_tensor * merc_gate_vd[3]   = {};
-    struct ggml_tensor * merc_gate_vb[3]   = {};
+    struct ggml_tensor * merc_gate_base = nullptr;   // stacked [a (decay), be (erase), bw (write)]
+    struct ggml_tensor * merc_gate_vd   = nullptr;
+    struct ggml_tensor * merc_gate_vb   = nullptr;
 
     // input scales
     struct ggml_tensor * wq_in_s            = nullptr;
