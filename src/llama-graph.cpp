@@ -509,7 +509,7 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    if (self_v_idxs && self_v_idxs->buffer) { mctx->set_input_v_idxs(self_v_idxs, ubatch); }   // unused (no V cache, e.g. mercurius): never allocated
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
@@ -632,7 +632,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
         if (self_v_idxs) {
-            mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
+            if (self_v_idxs && self_v_idxs->buffer) { mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch); }   // unused V indices (no V cache): never allocated
         }
     }
 
@@ -1108,7 +1108,7 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    if (inp_attn->self_v_idxs && inp_attn->self_v_idxs->buffer) { mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch); }   // unused V indices (no V cache): never allocated
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
@@ -1217,7 +1217,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
         attn_ctx->get_base()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-        attn_ctx->get_base()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+        if (inp_attn->self_v_idxs && inp_attn->self_v_idxs->buffer) { attn_ctx->get_base()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch); }   // unused V indices (no V cache): never allocated
     }
 
     if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {

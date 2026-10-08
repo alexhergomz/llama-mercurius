@@ -348,6 +348,8 @@ ggml_tensor * llama_model_mercurius::graph::build_layer_attn(llm_graph_input_att
     ggml_tensor * kq = ggml_mul_mat(ctx0, k_full, q_full);                                 // [n_kv, T, H]
     kq = ggml_reshape_4d(ctx0, kq, n_kv, T, rep, G);                                       // head h = j + rep*g
     ggml_tensor * rms_t = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, rms_all)), n_kv, 1, 1, G);
+    // unwritten cells of the KV window decode to rms 0: keep their (masked) scores finite instead of 0/0
+    rms_t = ggml_clamp(ctx0, rms_t, 1e-6f, INFINITY);
     kq = ggml_div(ctx0, kq, rms_t);                                                        // per-group key normaliser
     kq = ggml_reshape_3d(ctx0, kq, n_kv, T, H);
     kq = ggml_soft_max_ext(ctx0, kq, inp->get_kq_mask(), hparams.f_attention_scale, 0.0f);

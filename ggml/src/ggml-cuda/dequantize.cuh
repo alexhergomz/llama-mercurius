@@ -108,6 +108,13 @@ static __device__ __forceinline__ void dequantize_q5_1(const void * vx, const in
     v.y = (v.y * dm.x) + dm.y;
 }
 
+static __device__ __forceinline__ void dequantize_nf4(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_nf4 * x = (const block_nf4 *) vx;
+    const uint8_t c = x[ib].qs[iqs/2];     // iqs is even: elements iqs, iqs + 1
+    v.x = kvalues_nf4[c & 0xf] * x[ib].d;
+    v.y = kvalues_nf4[c >>  4] * x[ib].d;
+}
+
 static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q8_0 * x = (const block_q8_0 *) vx;
 

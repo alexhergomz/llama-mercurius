@@ -554,6 +554,15 @@ typedef union {
     uint16_t  u16;
 } iq1m_scale_t;
 
+// NF4 (bitsandbytes 4-bit NormalFloat, blocksize 64): value = kvalues_nf4[code] * d. d is the block absmax as
+// bitsandbytes dequantizes it (fp32, after its double quantization), so a bitsandbytes NF4 tensor is stored exactly.
+#define QK_NF4 64
+typedef struct {
+    float   d;               // block scale (absmax)
+    uint8_t qs[QK_NF4/2];    // codes: element 2i in the low nibble, 2i+1 in the high nibble
+} block_nf4;
+static_assert(sizeof(block_nf4) == sizeof(float) + QK_NF4/2, "wrong nf4 block size/padding");
+
 // Non-linear quants
 #define QK4_NL 32
 typedef struct {
@@ -1228,6 +1237,12 @@ GGML_TABLE_BEGIN(uint32_t, iq3s_grid, 512)
 GGML_TABLE_END()
 
 // TODO: fix name to kvalues_iq4_nl
+GGML_TABLE_BEGIN(float, kvalues_nf4, 16)
+    -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f, -0.28444138169288635f,
+    -0.18477343022823334f, -0.09105003625154495f, 0.0f, 0.07958029955625534f, 0.16093020141124725f,
+    0.24611230194568634f, 0.33791524171829224f, 0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f,
+GGML_TABLE_END()
+
 GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 GGML_TABLE_END()

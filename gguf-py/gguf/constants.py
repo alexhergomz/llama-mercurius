@@ -4964,6 +4964,7 @@ class GGMLQuantizationType(IntEnum):
     Q8_CR   = 48
     Q5_CR   = 49
     Q6_CR   = 50
+    NF4     = 51  # bitsandbytes NormalFloat-4: 64 values, fp32 absmax (mercurius)
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5140,6 +5141,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.IQ3_XXS: (256, 2 + QK_K // 4 + QK_K // 8),
     GGMLQuantizationType.IQ1_S:   (256, 2 + QK_K // 8 + QK_K // 16),
     GGMLQuantizationType.IQ4_NL:  (32, 2 + 16),
+    GGMLQuantizationType.NF4:     (64, 4 + 32),
     GGMLQuantizationType.IQ3_S:   (256, 2 + QK_K // 4 + QK_K // 8 + QK_K // 32 + 4),
     GGMLQuantizationType.IQ2_S:   (256, 2 + QK_K // 4 + QK_K // 16),
     GGMLQuantizationType.IQ4_XS:  (256, 2 + 2 + QK_K // 2 + QK_K // 64),

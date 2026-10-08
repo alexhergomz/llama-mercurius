@@ -243,6 +243,41 @@ static void ggml_vec_dot_tq4_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
                                        const void * GGML_RESTRICT vx, size_t bx,
                                        const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+// NF4 levels (same values as kvalues_nf4 in ggml-common.h, whose tables are not instantiated in this file)
+static const float nf4_levels[16] = {
+    -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f, -0.28444138169288635f,
+    -0.18477343022823334f, -0.09105003625154495f, 0.0f, 0.07958029955625534f, 0.16093020141124725f,
+    0.24611230194568634f, 0.33791524171829224f, 0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f,
+};
+
+// NF4 x Q8_0 (one NF4 block of 64 = two Q8_0 blocks of 32), scalar
+static void ggml_vec_dot_nf4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+                                  const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    assert(n % QK_NF4 == 0);
+    const block_nf4  * x = (const block_nf4  *) vx;
+    const block_q8_0 * y = (const block_q8_0 *) vy;
+    float sumf = 0.0f;
+    for (int i = 0; i < n / QK_NF4; ++i) {
+        float acc = 0.0f;
+        for (int h = 0; h < 2; ++h) {
+            const block_q8_0 * yb = &y[2*i + h];
+            float part = 0.0f;
+            for (int j = 0; j < QK8_0/2; ++j) {
+                const uint8_t c = x[i].qs[h*QK8_0/2 + j];
+                part += nf4_levels[c & 0xf] * yb->qs[2*j] + nf4_levels[c >> 4] * yb->qs[2*j + 1];
+            }
+            acc += part * GGML_CPU_FP16_TO_FP32(yb->d);
+        }
+        sumf += acc * x[i].d;
+    }
+    *s = sumf;
+}
+
+static void quantize_row_nf4_cpu(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_nf4_ref(x, (block_nf4 *) y, k);
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -424,6 +459,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = NULL,
         .vec_dot                  = ggml_vec_dot_iq1_m_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NF4] = {
+        .from_float               = quantize_row_nf4_cpu,
+        .vec_dot                  = ggml_vec_dot_nf4_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
     [GGML_TYPE_IQ4_NL] = {

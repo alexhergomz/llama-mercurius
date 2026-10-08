@@ -282,7 +282,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
-    if (!ggml_is_quantized(type)) {
+    if (!ggml_is_quantized(type) || type == GGML_TYPE_NF4) {
         return false;
     }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {

@@ -395,7 +395,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
     GGML_ASSERT(g->ne[0] == 1   || g->ne[0] == S_v);
     GGML_ASSERT(                   g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
-    GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
+    // beta: scalar, or channel-wise with a KDA gate (Gated DeltaNet-2 erase gate, mercurius)
+    GGML_ASSERT((b->ne[0] == 1 || (b->ne[0] == S_v && g->ne[0] == S_v)) && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].

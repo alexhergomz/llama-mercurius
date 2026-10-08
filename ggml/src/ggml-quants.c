@@ -2863,6 +2863,18 @@ void dequantize_row_iq1_m(const block_iq1_m * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+void dequantize_row_nf4(const block_nf4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NF4 == 0);
+    const int64_t nb = k / QK_NF4;
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = x[i].d;
+        for (int j = 0; j < QK_NF4/2; ++j) {
+            y[i*QK_NF4 + 2*j + 0] = kvalues_nf4[x[i].qs[j] & 0xf] * d;
+            y[i*QK_NF4 + 2*j + 1] = kvalues_nf4[x[i].qs[j] >>  4] * d;
+        }
+    }
+}
+
 void dequantize_row_iq4_nl(const block_iq4_nl * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK4_NL == 0);
     const int64_t nb = k / QK4_NL;
@@ -5237,6 +5249,43 @@ size_t quantize_iq4_nl(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     return nrow * nblock * sizeof(block_iq4_nl);
 }
 
+// NF4: d = block absmax, code = nearest level of x / d (bitsandbytes' rule: midpoints between the sorted levels)
+void quantize_row_nf4_ref(const float * GGML_RESTRICT x, block_nf4 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NF4 == 0);
+    const int64_t nb = k / QK_NF4;
+    for (int64_t i = 0; i < nb; ++i) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK_NF4; ++j) {
+            amax = fmaxf(amax, fabsf(x[i*QK_NF4 + j]));
+        }
+        y[i].d = amax;
+        const float id = amax > 0.0f ? 1.0f/amax : 0.0f;
+        for (int j = 0; j < QK_NF4/2; ++j) {
+            uint8_t c[2];
+            for (int h = 0; h < 2; ++h) {
+                const float v = x[i*QK_NF4 + 2*j + h] * id;
+                int best = 0;
+                for (int l = 1; l < 16; ++l) {
+                    if (v > 0.5f*(kvalues_nf4[l - 1] + kvalues_nf4[l])) {
+                        best = l;
+                    }
+                }
+                c[h] = (uint8_t) best;
+            }
+            y[i].qs[j] = c[0] | (c[1] << 4);
+        }
+    }
+}
+
+size_t quantize_nf4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    const size_t row_size = ggml_row_size(GGML_TYPE_NF4, n_per_row);
+    for (int64_t r = 0; r < nrow; ++r) {
+        quantize_row_nf4_ref(src + r*n_per_row, (block_nf4 *) ((char *) dst + r*row_size), n_per_row);
+    }
+    return nrow * row_size;
+}
+
 //void quantize_row_iq4_nl_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
 void quantize_row_iq4_nl_ref(const float * GGML_RESTRICT x, block_iq4_nl * GGML_RESTRICT y, int64_t k) {
     GGML_ASSERT(k%QK4_NL == 0);
@@ -5801,6 +5850,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_IQ4_NL:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
+            } break;
+        case GGML_TYPE_NF4:
+            {
+                const block_nf4 * q = (const block_nf4 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!isfinite(q[i].d)) {
+                        fprintf(stderr, "%s: invalid NF4 scale at block %zu\n", __func__, i);
+                        return false;
+                    }
+                }
             } break;
 
         case GGML_TYPE_I8:
