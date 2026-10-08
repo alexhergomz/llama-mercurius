@@ -11,3 +11,4 @@ DECL_FATTN_MMA_F16_CASE(256, 256, 16, 4);
 DECL_FATTN_MMA_F16_CASE(512, 512, 16, 4);
 DECL_FATTN_MMA_F16_CASE(576, 512, 16, 4);
 DECL_FATTN_MMA_F16_CASE(448, 256, 16, 4);
+template void ggml_cuda_flash_attn_ext_mma_f16_partial_case<448, 256, 16, 4>(ggml_backend_cuda_context &, ggml_tensor *, float *, float2 *); // Mercurius sliced prefill

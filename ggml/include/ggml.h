@@ -587,6 +587,7 @@ extern "C" {
         GGML_OP_MERC_TQ_UNPACK,
         GGML_OP_MERC_TQ_ATTN,
         GGML_OP_MERC_TQ_EXPAND,
+        GGML_OP_MERC_TQ_PREFILL,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2701,6 +2702,26 @@ extern "C" {
             int                   r,
             int                   rd,
             int                   G,
+            float                 freq_base);
+
+    // Mercurius prefill attention in the expanded form, without materializing the expanded cache: the packed cache is
+    // processed in slices; each slice is decoded and expanded (as ggml_merc_tq_expand) into a bounded f16 buffer,
+    // attended with flash attention in partial mode (numerator + running max/sum), and merged online by log-sum-exp.
+    // q: [Ek, T, H] f32 (expanded queries, RoPE applied), mask [n_kv, >= T] f16. Returns [D, H, T] f32 (as FA).
+    GGML_API struct ggml_tensor * ggml_merc_tq_prefill(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * packed,
+            struct ggml_tensor  * cb_latent,
+            struct ggml_tensor  * cb_rope,
+            struct ggml_tensor  * rope_unrot,
+            struct ggml_tensor  * k_up,
+            struct ggml_tensor  * v_up,
+            struct ggml_tensor  * mask,
+            int                   r,
+            int                   rd,
+            int                   G,
+            float                 scale,
             float                 freq_base);
 
     // DeepSeek V4 Lightning Indexer

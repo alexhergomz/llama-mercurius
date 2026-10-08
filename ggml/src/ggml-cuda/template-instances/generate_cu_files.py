@@ -103,6 +103,8 @@ for ncols in [8, 16, 32, 64]:
                     continue
                 head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))
+                if head_size_kq == 448 and ncols1 == 16:
+                    f.write("template void ggml_cuda_flash_attn_ext_mma_f16_partial_case<448, 256, 16, 4>(ggml_backend_cuda_context &, ggml_tensor *, float *, float2 *); // Mercurius sliced prefill\n")
 
 for type in TYPES_MMQ:
     with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:

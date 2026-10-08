@@ -1871,7 +1871,8 @@ ggml_type llama_kv_cache::type_k() const {
 }
 
 ggml_type llama_kv_cache::type_v() const {
-    return layers[0].v->type;
+    // K-only caches (e.g. Mercurius: values are read from the packed latent in K) have no V tensor
+    return layers[0].v ? layers[0].v->type : layers[0].k->type;
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {

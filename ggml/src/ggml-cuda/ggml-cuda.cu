@@ -1036,9 +1036,9 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size_for_device(
         int device, const ggml_tensor * tensor) {
-    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
-        ? ggml_cuda_flash_attn_ext_get_alloc_size(device, tensor)
-        : ggml_nbytes(tensor);
+    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT ? ggml_cuda_flash_attn_ext_get_alloc_size(device, tensor)
+                : tensor->op == GGML_OP_MERC_TQ_PREFILL  ? ggml_cuda_merc_tq_prefill_get_alloc_size(tensor)
+                : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
     // TQ4_1S → q8_0 load-time conversion: allocate q8_0-sized space if opted in
@@ -3719,6 +3719,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MERC_TQ_EXPAND:
             ggml_cuda_op_merc_tq_expand(ctx, dst);
+            break;
+        case GGML_OP_MERC_TQ_PREFILL:
+            ggml_cuda_op_merc_tq_prefill(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -7057,7 +7060,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_MERC_TQ_EXPAND:
             return op->src[2]->ne[0] == 31 && op->op_params[2] <= 4;
+        case GGML_OP_MERC_TQ_PREFILL:
+            // MMA flash attention (Turing+) instantiated for the expanded 448/256 heads, 4 KV groups
+            return turing_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc) &&
+                   op->src[0]->ne[0] == 448 && op->src[6]->ne[1] == 256 && ggml_get_op_params_i32(op, 2) == 4 &&
+                   op->src[7] && op->src[7]->type == GGML_TYPE_F16 && (op->src[1]->ne[1] * op->src[1]->ne[2]) % 256 == 0;
         case GGML_OP_MERC_TQ_ATTN:
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            return false;                               // WMMA kernels: NVIDIA only; the CPU fallback runs instead
+#endif
             return op->src[0]->ne[2] == 16 && ggml_get_op_params_i32(op, 1) % 16 == 0 &&
                    (op->src[4]->type == GGML_TYPE_F32 || op->src[4]->type == GGML_TYPE_F16);
         case GGML_OP_DSV4_HC_COMB:

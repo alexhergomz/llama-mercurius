@@ -342,17 +342,14 @@ ggml_tensor * llama_model_mercurius::graph::build_layer_attn(llm_graph_input_att
     GGML_ASSERT(kc->ne[3] == 1 && "mercurius: one KV stream");
     const int64_t n_kv = kc->ne[2];
     const bool plain_rope = freq_scale == 1.0f && ext_factor == 0.0f && attn_factor == 1.0f;
-    // prefill: expanded per-group K / V (f16) + flash attention (absorbed attention costs ~1.7x more per pair once the
-    // expansion is shared by more than ~140 queries); decode and short batches: the fused absorbed kernel
+    // prefill: expanded per-group K / V + flash attention, one bounded slice of the cache at a time (the absorbed
+    // form costs ~1.7x more per pair once the expansion is shared by more than ~140 queries); decode and short
+    // batches: the fused absorbed kernel
     if (T > 8 && cparams.flash_attn && layer.merc_q_exp && layer.merc_k_up && n_kv % 256 == 0 && plain_rope) {
         ggml_tensor * qe = map_query(layer.merc_q_exp);                                    // [Ek, T, H]
-        const int64_t Ek = qe->ne[0];
-        ggml_tensor * kv = ggml_merc_tq_expand(ctx0, kc, layer.merc_tq_latent_cb, layer.merc_tq_rope_cb,
-                                               layer.merc_rope_unrot, layer.merc_k_up, layer.merc_v_up, r, rd, G, freq_base);
-        ggml_tensor * Kx = ggml_view_3d(ctx0, kv, Ek, n_kv, G, kv->nb[1], Ek * ggml_element_size(kv), 0);
-        ggml_tensor * Vx = ggml_view_3d(ctx0, kv, D, n_kv, G, kv->nb[1], D * ggml_element_size(kv), Ek * G * ggml_element_size(kv));
-        ggml_tensor * fa = ggml_flash_attn_ext(ctx0, qe, Kx, Vx, inp->get_kq_mask(), hparams.f_attention_scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        ggml_tensor * fa = ggml_merc_tq_prefill(ctx0, qe, kc, layer.merc_tq_latent_cb, layer.merc_tq_rope_cb,
+                                                layer.merc_rope_unrot, layer.merc_k_up, layer.merc_v_up,
+                                                inp->get_kq_mask(), r, rd, G, hparams.f_attention_scale, freq_base);
         ggml_tensor * o = ggml_reshape_2d(ctx0, fa, D * H, T);                              // fa: [D, H, T]
         o = ggml_mul(ctx0, o, ggml_sigmoid(ctx0, gate));
         cur = ggml_mul_mat(ctx0, layer.wo, o);

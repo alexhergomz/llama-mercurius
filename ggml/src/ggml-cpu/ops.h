@@ -110,6 +110,8 @@ void ggml_compute_forward_merc_tq_pack(const struct ggml_compute_params * params
 void ggml_compute_forward_merc_tq_unpack(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_merc_tq_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_merc_tq_expand(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_merc_tq_prefill(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+size_t ggml_merc_tq_prefill_cpu_wsize(const struct ggml_tensor * dst, int n_tasks);
 void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);

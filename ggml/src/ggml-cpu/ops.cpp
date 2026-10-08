@@ -11509,60 +11509,157 @@ void ggml_compute_forward_merc_tq_attn(const ggml_compute_params * params, ggml_
     }
 }
 
+// one cache cell, expanded: per group K_g = [rope key | res | nope_g] / rms_g (Ek) and V_g (D), f32
+static void merc_tq_expand_cell(const uint8_t * row, const ggml_tensor * un, const ggml_tensor * ku, const ggml_tensor * vu,
+        const float * cbl, const float * cbr, int r, int rd, int G, float theta_scale, float * kout, float * vout,
+        float * raw, float * c, float * kt, float * kn) {
+    const int D = (int) vu->ne[1], nres = (G - 1) * rd, nope = D - rd, Ek = rd + nres + nope;
+    auto wget = [](const ggml_tensor * t, int64_t i) {
+        return t->type == GGML_TYPE_F32 ? ((const float *) t->data)[i] : GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) t->data)[i]);
+    };
+    int32_t pos; memcpy(&pos, row, 4);
+    ggml_fp16_t nl, nr;
+    memcpy(&nl, row + 4 + 4 * G, 2);
+    memcpy(&nr, row + 4 + 4 * G + 2, 2);
+    const uint8_t * rope_codes = row + 4 + 4 * G + 4;
+    merc_tq_decode(rope_codes, nr, rd, cbr, raw);
+    merc_tq_decode(rope_codes + rd / 2, nl, r, cbl, c);
+    for (int i = 0; i < rd / 2; ++i) {
+        float x0 = 0.0f, x1 = 0.0f;
+        for (int k = 0; k < rd; ++k) {
+            x0 += wget(un, (int64_t) i * rd + k) * raw[k];
+            x1 += wget(un, (int64_t) (i + rd / 2) * rd + k) * raw[k];
+        }
+        const float th = (float) pos * powf(theta_scale, (float) i);
+        kt[i] = x0 * cosf(th) - x1 * sinf(th);
+        kt[i + rd / 2] = x0 * sinf(th) + x1 * cosf(th);
+    }
+    for (int o = 0; o < nres + G * nope; ++o) {
+        float acc = 0.0f;
+        for (int e = 0; e < r; ++e) acc += wget(ku, (int64_t) o * r + e) * c[e];
+        kn[o] = acc;
+    }
+    for (int o = 0; o < D * G; ++o) {
+        float acc = 0.0f;
+        for (int e = 0; e < r; ++e) acc += wget(vu, (int64_t) o * r + e) * c[e];
+        vout[o] = acc;
+    }
+    for (int g = 0; g < G; ++g) {
+        float rms; memcpy(&rms, row + 4 + 4 * g, 4);
+        const float inv = 1.0f / (rms > 1e-6f ? rms : 1e-6f);
+        float * k = kout + (int64_t) g * Ek;
+        for (int i = 0; i < rd; ++i)   k[i]             = kt[i] * inv;
+        for (int i = 0; i < nres; ++i) k[rd + i]        = kn[i] * inv;
+        for (int i = 0; i < nope; ++i) k[rd + nres + i] = kn[nres + g * nope + i] * inv;
+    }
+}
+
+// per-thread scratch of merc_tq_expand_cell
+static size_t merc_tq_cell_scratch(int r, int rd, int G, int D) {
+    return (size_t) rd + r + rd + ((G - 1) * rd + G * (D - rd));
+}
+
 void ggml_compute_forward_merc_tq_expand(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * pk = dst->src[0], * un = dst->src[3], * ku = dst->src[4], * vu = dst->src[5];
     const float * cbl = (const float *) dst->src[1]->data;
     const float * cbr = (const float *) dst->src[2]->data;
     const int r = ggml_get_op_params_i32(dst, 0), rd = ggml_get_op_params_i32(dst, 1), G = ggml_get_op_params_i32(dst, 2);
     const float freq_base = ggml_get_op_params_f32(dst, 3);
-    const int D = (int) vu->ne[1], nres = (G - 1) * rd, nope = D - rd, Ek = rd + nres + nope;
+    const int D = (int) vu->ne[1], Ek = rd + (G - 1) * rd + (D - rd);
     const int64_t n_kv = pk->ne[1] * pk->ne[2];
     const size_t nb_cell = pk->ne[1] == 1 ? pk->nb[2] : pk->nb[1];
     const float theta_scale = powf(freq_base, -2.0f / rd);
-    auto wget = [](const ggml_tensor * t, int64_t i) {
-        return t->type == GGML_TYPE_F32 ? ((const float *) t->data)[i] : GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) t->data)[i]);
-    };
-    std::vector<float> raw(rd), c(r), kt(rd), kn(nres + G * nope), vv((size_t) D * G);
+    std::vector<float> y((size_t) G * (Ek + D)), sc(merc_tq_cell_scratch(r, rd, G, D));
     for (int64_t j = params->ith; j < n_kv; j += params->nth) {
-        const uint8_t * row = (const uint8_t *) pk->data + j * nb_cell;
-        int32_t pos; memcpy(&pos, row, 4);
-        ggml_fp16_t nl, nr;
-        memcpy(&nl, row + 4 + 4 * G, 2);
-        memcpy(&nr, row + 4 + 4 * G + 2, 2);
-        const uint8_t * rope_codes = row + 4 + 4 * G + 4;
-        merc_tq_decode(rope_codes, nr, rd, cbr, raw.data());
-        merc_tq_decode(rope_codes + rd / 2, nl, r, cbl, c.data());
-        for (int i = 0; i < rd / 2; ++i) {
-            float x0 = 0.0f, x1 = 0.0f;
-            for (int k = 0; k < rd; ++k) {
-                x0 += wget(un, (int64_t) i * rd + k) * raw[k];
-                x1 += wget(un, (int64_t) (i + rd / 2) * rd + k) * raw[k];
+        merc_tq_expand_cell((const uint8_t *) pk->data + j * nb_cell, un, ku, vu, cbl, cbr, r, rd, G, theta_scale,
+                            y.data(), y.data() + (size_t) G * Ek, sc.data(), sc.data() + rd, sc.data() + rd + r, sc.data() + 2 * rd + r);
+        ggml_fp16_t * o = (ggml_fp16_t *) ((char *) dst->data + j * dst->nb[1]);
+        for (size_t i = 0; i < y.size(); ++i) o[i] = GGML_CPU_FP32_TO_FP16(y[i]);
+    }
+}
+
+// GGML_OP_MERC_TQ_PREFILL (reference): slices of MERC_CPU_SLICE cells are expanded into the work buffer, then every
+// (token, head) row folds the slice into its running softmax (numerator in dst, max/sum in the work buffer).
+#define MERC_CPU_SLICE 1024
+
+size_t ggml_merc_tq_prefill_cpu_wsize(const ggml_tensor * dst, int n_tasks) {
+    const int r = ggml_get_op_params_i32(dst, 0), rd = ggml_get_op_params_i32(dst, 1), G = ggml_get_op_params_i32(dst, 2);
+    const int64_t D = dst->src[6]->ne[1], Ek = dst->src[0]->ne[0];
+    const int64_t n_kv = dst->src[1]->ne[1] * dst->src[1]->ne[2];
+    const int64_t S = std::min<int64_t>(n_kv, MERC_CPU_SLICE);
+    return sizeof(float) * (S * G * (Ek + D) + 2 * dst->ne[1] * dst->ne[2] +
+                            n_tasks * (merc_tq_cell_scratch(r, rd, G, (int) D) + S));
+}
+
+void ggml_compute_forward_merc_tq_prefill(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0], * pk = dst->src[1], * un = dst->src[4], * ku = dst->src[5], * vu = dst->src[6];
+    const ggml_tensor * mask = dst->src[7];
+    const float * cbl = (const float *) dst->src[2]->data;
+    const float * cbr = (const float *) dst->src[3]->data;
+    const int r = ggml_get_op_params_i32(dst, 0), rd = ggml_get_op_params_i32(dst, 1), G = ggml_get_op_params_i32(dst, 2);
+    const float scale = ggml_get_op_params_f32(dst, 3), freq_base = ggml_get_op_params_f32(dst, 4);
+    const int64_t D = vu->ne[1], Ek = q->ne[0], T = q->ne[1], H = q->ne[2], rep = H / G;
+    const int64_t n_kv = pk->ne[1] * pk->ne[2];
+    const int64_t S = std::min<int64_t>(n_kv, MERC_CPU_SLICE);
+    const size_t nb_cell = pk->ne[1] == 1 ? pk->nb[2] : pk->nb[1];
+    const float theta_scale = powf(freq_base, -2.0f / rd);
+    const int ith = params->ith, nth = params->nth;
+    float * kvs = (float *) params->wdata;                                   // [S][G*Ek | G*D]
+    float * ml  = kvs + S * G * (Ek + D);                                    // [T*H][max, sum]
+    float * sc  = ml + 2 * T * H + (size_t) ith * (merc_tq_cell_scratch(r, rd, G, (int) D) + S);
+    float * sv  = sc + merc_tq_cell_scratch(r, rd, G, (int) D);              // scores of one row over the slice
+    const int64_t row_f = G * (Ek + D);
+    for (int64_t i = ith; i < T * H; i += nth) {
+        ml[2 * i] = -INFINITY; ml[2 * i + 1] = 0.0f;
+        memset((char *) dst->data + i * dst->nb[1], 0, D * sizeof(float));
+    }
+    for (int64_t js = 0; js < n_kv; js += S) {
+        const int64_t nc = std::min(S, n_kv - js);
+        ggml_barrier(params->threadpool);
+        for (int64_t j = ith; j < nc; j += nth) {
+            float * y = kvs + j * row_f;
+            merc_tq_expand_cell((const uint8_t *) pk->data + (js + j) * nb_cell, un, ku, vu, cbl, cbr, r, rd, G,
+                                theta_scale, y, y + G * Ek, sc, sc + rd, sc + rd + r, sc + 2 * rd + r);
+        }
+        ggml_barrier(params->threadpool);
+        for (int64_t i = ith; i < T * H; i += nth) {                         // row i = t*H + h (dst [D, H, T])
+            const int64_t t = i / H, h = i % H, g = h / rep;
+            const float * qr = (const float *) ((const char *) q->data + t * q->nb[1] + h * q->nb[2]);
+            float m = ml[2 * i], l = ml[2 * i + 1], mnew = m;
+            for (int64_t j = 0; j < nc; ++j) {
+                const float mv = mask->type == GGML_TYPE_F16
+                    ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) ((const char *) mask->data + t * mask->nb[1]))[js + j])
+                    : ((const float *) ((const char *) mask->data + t * mask->nb[1]))[js + j];
+                float s = -INFINITY;
+                if (mv != -INFINITY) {
+                    const float * k = kvs + j * row_f + g * Ek;
+                    float d = 0.0f;
+                    for (int64_t e = 0; e < Ek; ++e) d += qr[e] * k[e];
+                    s = d * scale + mv;
+                }
+                sv[j] = s;
+                mnew = std::max(mnew, s);
             }
-            const float th = (float) pos * powf(theta_scale, (float) i);
-            kt[i] = x0 * cosf(th) - x1 * sinf(th);
-            kt[i + rd / 2] = x0 * sinf(th) + x1 * cosf(th);
+            if (mnew == -INFINITY) continue;                                 // nothing visible in this slice
+            float * o = (float *) ((char *) dst->data + i * dst->nb[1]);
+            const float a = m == -INFINITY ? 0.0f : expf(m - mnew);
+            l *= a;
+            for (int64_t e = 0; e < D; ++e) o[e] *= a;
+            for (int64_t j = 0; j < nc; ++j) {
+                if (sv[j] == -INFINITY) continue;
+                const float p = expf(sv[j] - mnew);
+                l += p;
+                const float * v = kvs + j * row_f + G * Ek + g * D;
+                for (int64_t e = 0; e < D; ++e) o[e] += p * v[e];
+            }
+            ml[2 * i] = mnew; ml[2 * i + 1] = l;
         }
-        for (int o = 0; o < nres + G * nope; ++o) {
-            float acc = 0.0f;
-            for (int e = 0; e < r; ++e) acc += wget(ku, (int64_t) o * r + e) * c[e];
-            kn[o] = acc;
-        }
-        for (int o = 0; o < D * G; ++o) {
-            float acc = 0.0f;
-            for (int e = 0; e < r; ++e) acc += wget(vu, (int64_t) o * r + e) * c[e];
-            vv[o] = acc;
-        }
-        ggml_fp16_t * y = (ggml_fp16_t *) ((char *) dst->data + j * dst->nb[1]);
-        for (int g = 0; g < G; ++g) {
-            float rms; memcpy(&rms, row + 4 + 4 * g, 4);
-            const float inv = 1.0f / (rms > 1e-6f ? rms : 1e-6f);
-            ggml_fp16_t * k = y + (int64_t) g * Ek;
-            for (int i = 0; i < rd; ++i)   k[i]              = GGML_CPU_FP32_TO_FP16(kt[i] * inv);
-            for (int i = 0; i < nres; ++i) k[rd + i]         = GGML_CPU_FP32_TO_FP16(kn[i] * inv);
-            for (int i = 0; i < nope; ++i) k[rd + nres + i]  = GGML_CPU_FP32_TO_FP16(kn[nres + g * nope + i] * inv);
-            ggml_fp16_t * v = y + (int64_t) G * Ek + (int64_t) g * D;
-            for (int i = 0; i < D; ++i) v[i] = GGML_CPU_FP32_TO_FP16(vv[(int64_t) g * D + i]);
-        }
+    }
+    ggml_barrier(params->threadpool);
+    for (int64_t i = ith; i < T * H; i += nth) {
+        float * o = (float *) ((char *) dst->data + i * dst->nb[1]);
+        const float l = ml[2 * i + 1];
+        for (int64_t e = 0; e < D; ++e) o[e] = l > 0.0f ? o[e] / l : 0.0f;
     }
 }
 

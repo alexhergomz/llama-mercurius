@@ -6,3 +6,5 @@ void ggml_cuda_op_merc_tq_pack(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 void ggml_cuda_op_merc_tq_unpack(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_merc_tq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_merc_tq_expand(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_merc_tq_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+size_t ggml_cuda_merc_tq_prefill_get_alloc_size(const ggml_tensor * dst);

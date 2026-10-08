@@ -2328,6 +2328,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_merc_tq_expand(params, tensor);
             } break;
+        case GGML_OP_MERC_TQ_PREFILL:
+            {
+                ggml_compute_forward_merc_tq_prefill(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2529,6 +2533,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MERC_TQ_UNPACK:
         case GGML_OP_MERC_TQ_ATTN:
         case GGML_OP_MERC_TQ_EXPAND:
+        case GGML_OP_MERC_TQ_PREFILL:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -3274,6 +3279,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_MERC_TQ_EXPAND:
                     {
                         cur = 0;
+                    } break;
+                case GGML_OP_MERC_TQ_PREFILL:
+                    {
+                        cur = ggml_merc_tq_prefill_cpu_wsize(node, n_tasks);
                     } break;
                 case GGML_OP_MERC_TQ_ATTN:
                     {
