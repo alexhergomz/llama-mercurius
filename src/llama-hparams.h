@@ -89,6 +89,12 @@ struct llama_hparams {
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
+
+    // mercurius: per-layer MLA latent width and packed cache row size in 32-bit words (0 = not a packed layer)
+    std::array<uint32_t, LLAMA_MAX_LAYERS> merc_latent_rank = {};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> merc_cache_words = {};
+    float    merc_k_norm_eps    = 1e-6f;
+    uint32_t merc_vera_rank     = 0;
     uint32_t n_ff_exp           = 0;
     uint32_t n_ff_shexp         = 0;
     uint32_t n_ff_chexp         = 0;

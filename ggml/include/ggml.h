@@ -582,6 +582,8 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_TURBO_WHT,
+        GGML_OP_MERC_TQ_PACK,
+        GGML_OP_MERC_TQ_UNPACK,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2585,7 +2587,9 @@ extern "C" {
     //   q, k  : [S_k, H_k, n_tokens, n_seqs]
     //   v     : [S_v, H_v, n_tokens, n_seqs]
     //   g     : [1, H_v, n_tokens, n_seqs] (scalar gate) or [S_v, H_v, n_tokens, n_seqs] (KDA)
-    //   beta  : [1, H_v, n_tokens, n_seqs]
+    //   beta  : [1, H_v, n_tokens, n_seqs], or [S_k, H_v, n_tokens, n_seqs] with KDA g: a channel-wise ERASE gate b
+    //           (Gated DeltaNet-2): S <- D S + k (v - S^T (b * k))^T. The channel-wise write gate is folded into v by
+    //           the caller (v <- w * v). A scalar beta is the special case b = beta * 1 with v <- beta * v.
     //   state : [S_v, S_v, H_v, n_seqs] -- initial recurrent state s0
     //
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K trailing
@@ -2631,6 +2635,34 @@ extern "C" {
             int                   direction,
             int                   group_size,    // 0 = auto (64 or 128 from ne[0])
             struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+
+    // Mercurius-1-4B compressed attention cache (TurboQuant-MSE 4-bit, its trained format): one row per token holding
+    //   [pos i32 | inv_r f32 x G | latent norm f16 | rope-key norm f16 | rope-key codes (rd/2 B) | latent codes (ceil(r/2) B)]
+    // as raw 32-bit words (`words` per row), so the cache is an F32 tensor written by ggml_set_rows bit for bit.
+    // Codes: per-vector fp16 norm n = ||x||, index = #{boundaries < x/n} into the Beta Lloyd-Max codebook of the vector's
+    // width (cb: 16 centroids followed by 15 boundaries, F32). Decode: centroid[index] * n.
+    //   pack:   c [r, T], kr [rd, T], inv_r [G, T] (F32), pos [T] (I32) -> [words, T] (F32 words)
+    //   unpack: packed [words, n] -> mode 0: [r + rd + G, n] F32 (decoded latent | decoded rope key | inv_r)
+    //                                mode 1: [n] I32 positions
+    GGML_API struct ggml_tensor * ggml_merc_tq_pack(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * kr,
+            struct ggml_tensor  * inv_r,
+            struct ggml_tensor  * pos,
+            struct ggml_tensor  * cb_latent,
+            struct ggml_tensor  * cb_rope,
+            int                   words);
+
+    GGML_API struct ggml_tensor * ggml_merc_tq_unpack(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * packed,
+            struct ggml_tensor  * cb_latent,
+            struct ggml_tensor  * cb_rope,
+            int                   r,
+            int                   rd,
+            int                   G,
+            int                   mode);
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(

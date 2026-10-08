@@ -106,6 +106,8 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_turbo_wht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_merc_tq_pack(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_merc_tq_unpack(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);

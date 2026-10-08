@@ -145,6 +145,7 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
+    LLM_ARCH_MERCURIUS,
     LLM_ARCH_TALKIE,
     LLM_ARCH_MELLUM,
     LLM_ARCH_EAGLE3,
@@ -246,6 +247,10 @@ enum llm_kv {
     LLM_KV_ATTENTION_CAUSAL,
     LLM_KV_ATTENTION_Q_LORA_RANK,
     LLM_KV_ATTENTION_KV_LORA_RANK,
+    LLM_KV_ATTENTION_LATENT_RANKS,
+    LLM_KV_ATTENTION_CACHE_WORDS,
+    LLM_KV_ATTENTION_K_NORM_EPS,
+    LLM_KV_VERA_RANK,
     LLM_KV_ATTENTION_DECAY_LORA_RANK,
     LLM_KV_ATTENTION_ICLR_LORA_RANK,
     LLM_KV_ATTENTION_VALUE_RESIDUAL_MIX_LORA_RANK,
@@ -509,6 +514,27 @@ enum llm_tensor {
     LLM_TENSOR_SSM_CONV1D_Q,        // kimi: Q conv1d weight
     LLM_TENSOR_SSM_CONV1D_K,        // kimi: K conv1d weight
     LLM_TENSOR_SSM_CONV1D_V,        // kimi: V conv1d weight
+    LLM_TENSOR_ATTN_Q_MAP,          // mercurius: per-head [pre-RoPE | absorbed] query map
+    LLM_TENSOR_ATTN_K_ROPE,         // mercurius: decoupled RoPE key projection (rotation folded)
+    LLM_TENSOR_ATTN_ROPE_UNROT,     // mercurius: R0^T for the RoPE key
+    LLM_TENSOR_ATTN_LATENT,         // mercurius: MLA latent down-projection (rotation folded)
+    LLM_TENSOR_ATTN_V_UP,           // mercurius: per-group value up-projection from the latent
+    LLM_TENSOR_ATTN_K_RMS,          // mercurius: original key projection for the per-group 1/rms
+    LLM_TENSOR_ATTN_TQ_LATENT_CB,   // mercurius: TurboQuant codebook (16 centroids + 15 bounds) of the latent
+    LLM_TENSOR_ATTN_TQ_ROPE_CB,     // mercurius: TurboQuant codebook of the RoPE key
+    LLM_TENSOR_SSM_A_LORA_A,        // mercurius: decay LoRA
+    LLM_TENSOR_SSM_A_LORA_B,
+    LLM_TENSOR_GATE_A_BASE,         // mercurius: factored GDN-2 gates (tiled base rows + VeRA vectors)
+    LLM_TENSOR_GATE_A_VD,
+    LLM_TENSOR_GATE_A_VB,
+    LLM_TENSOR_GATE_BE_BASE,
+    LLM_TENSOR_GATE_BE_VD,
+    LLM_TENSOR_GATE_BE_VB,
+    LLM_TENSOR_GATE_BW_BASE,
+    LLM_TENSOR_GATE_BW_VD,
+    LLM_TENSOR_GATE_BW_VB,
+    LLM_TENSOR_VERA_A,              // mercurius: VeRA factors shared by every gate
+    LLM_TENSOR_VERA_B,
     LLM_TENSOR_SSM_F_A,             // kimi: forget gate projection A
     LLM_TENSOR_SSM_F_B,             // kimi: forget gate projection B
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5

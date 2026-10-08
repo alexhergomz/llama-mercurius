@@ -2271,6 +2271,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_turbo_wht(params, tensor);
             } break;
+        case GGML_OP_MERC_TQ_PACK:
+            {
+                ggml_compute_forward_merc_tq_pack(params, tensor);
+            } break;
+        case GGML_OP_MERC_TQ_UNPACK:
+            {
+                ggml_compute_forward_merc_tq_unpack(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2468,6 +2476,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_TURBO_WHT:
+        case GGML_OP_MERC_TQ_PACK:
+        case GGML_OP_MERC_TQ_UNPACK:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -3202,8 +3212,13 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t K          = ggml_get_op_params_i32(node, 0);
                         const int64_t emit_mode  = ggml_get_op_params_i32(node, 1);
                         const bool    use_scratch = (K > 1) || (emit_mode != 0);
-                        const int64_t per_thread = S_v + (use_scratch ? S_v * S_v : 0);
+                        const int64_t per_thread = 2 * S_v + (use_scratch ? S_v * S_v : 0);   // + b*k scratch
                         cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_MERC_TQ_PACK:
+                case GGML_OP_MERC_TQ_UNPACK:
+                    {
+                        cur = 0;
                     } break;
                 case GGML_OP_TURBO_WHT:
                     {

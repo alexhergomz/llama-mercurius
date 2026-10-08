@@ -561,7 +561,7 @@ llama_kv_cache::llama_kv_cache(
 
 
         const bool has_k = true;
-        const bool has_v = !is_mla;
+        const bool has_v = !is_mla && hparams.merc_cache_words[il] == 0;   // mercurius packed layers: K only
 
         // Layer-adaptive: use higher precision for quality-sensitive layers.
         // See kv_adaptive_mode above for the mode legend and env var.
@@ -606,7 +606,12 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
+        // mercurius: one packed row of TurboQuant codes per token (raw 32-bit words), no V cache
+        const bool merc_packed = hparams.merc_cache_words[il] > 0;
+        if (merc_packed) {
+            n_embd_k_gqa_eff = hparams.merc_cache_words[il];
+        }
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, merc_packed ? GGML_TYPE_F32 : layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
@@ -1672,6 +1677,10 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
+    // Mercurius stores TurboQuant codes of the pre-RoPE key: no in-place K-shift.
+    if (model.arch == LLM_ARCH_MERCURIUS) {
+        return false;
+    }
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
@@ -1921,6 +1930,15 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
+
+    if (hparams.merc_cache_words[il] > 0) {           // mercurius packed rows: [words, 1, n_kv, ns]
+        const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+        return ggml_view_4d(ctx, k, n_embd_k_gqa, 1, n_kv, ns,
+                ggml_row_size(k->type, n_embd_k_gqa),
+                ggml_row_size(k->type, n_embd_k_gqa),
+                ggml_row_size(k->type, n_embd_k_gqa*kv_size),
+                ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+    }
 
     // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
     const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);

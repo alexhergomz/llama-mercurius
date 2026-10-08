@@ -1144,6 +1144,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "TURBO_WHT",
+    "MERC_TQ_PACK",
+    "MERC_TQ_UNPACK",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
@@ -1165,7 +1167,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1260,6 +1262,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "turbo_wht(a)",
+    "merc_tq_pack(c,kr,inv_r,pos)",
+    "merc_tq_unpack(x)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -1281,7 +1285,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6363,7 +6367,10 @@ struct ggml_tensor * ggml_gated_delta_net(
 
     // gate: scalar [1, H, T, B] or vector [S_v, H, T, B] (KDA)
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
-    GGML_ASSERT(beta->ne[0] == 1);
+    // beta: scalar [1, H, T, B], or a channel-wise erase gate [S_k, H, T, B] (Gated DeltaNet-2; needs KDA g, no
+    // ingredient emission: the replay path stores a scalar beta)
+    GGML_ASSERT(beta->ne[0] == 1 || (beta->ne[0] == S_v && g->ne[0] == S_v && emit_mode == 0));
+    GGML_ASSERT(ggml_are_same_shape(g, beta) || beta->ne[0] == 1);
 
     // state holds the initial state s0 only: [S_v, S_v, H, n_seqs]. K (snapshot slot count) is an op param.
     GGML_ASSERT(state->ne[0] == S_v);
@@ -6396,6 +6403,77 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
+    return result;
+}
+
+// ggml_merc_tq_pack / ggml_merc_tq_unpack (Mercurius compressed attention cache, see ggml.h)
+
+static int ggml_merc_tq_row_bytes(int r, int rd, int G) {
+    return 4 + 4*G + 2 + 2 + rd/2 + (r + 1)/2;
+}
+
+struct ggml_tensor * ggml_merc_tq_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * kr,
+        struct ggml_tensor  * inv_r,
+        struct ggml_tensor  * pos,
+        struct ggml_tensor  * cb_latent,
+        struct ggml_tensor  * cb_rope,
+        int                   words) {
+    GGML_ASSERT(c->type == GGML_TYPE_F32 && kr->type == GGML_TYPE_F32 && inv_r->type == GGML_TYPE_F32);
+    GGML_ASSERT(pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(cb_latent->type == GGML_TYPE_F32 && cb_rope->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(cb_latent) == 31 && ggml_nelements(cb_rope) == 31);
+    GGML_ASSERT(ggml_is_contiguous(cb_latent) && ggml_is_contiguous(cb_rope));
+    const int64_t T = c->ne[1];
+    GGML_ASSERT(ggml_nrows(c) == T && ggml_nrows(kr) == T && ggml_nrows(inv_r) == T && ggml_nelements(pos) == T);
+    const int r = (int) c->ne[0], rd = (int) kr->ne[0], G = (int) inv_r->ne[0];
+    GGML_ASSERT(rd % 2 == 0);
+    GGML_ASSERT(4*words >= ggml_merc_tq_row_bytes(r, rd, G));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, words, T);
+    ggml_set_op_params_i32(result, 0, words);
+    ggml_set_op_params_i32(result, 1, r);
+    ggml_set_op_params_i32(result, 2, rd);
+    ggml_set_op_params_i32(result, 3, G);
+    result->op     = GGML_OP_MERC_TQ_PACK;
+    result->src[0] = c;
+    result->src[1] = kr;
+    result->src[2] = inv_r;
+    result->src[3] = pos;
+    result->src[4] = cb_latent;
+    result->src[5] = cb_rope;
+    return result;
+}
+
+struct ggml_tensor * ggml_merc_tq_unpack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed,
+        struct ggml_tensor  * cb_latent,
+        struct ggml_tensor  * cb_rope,
+        int                   r,
+        int                   rd,
+        int                   G,
+        int                   mode) {
+    GGML_ASSERT(packed->type == GGML_TYPE_F32);
+    GGML_ASSERT(mode == 0 || mode == 1);
+    GGML_ASSERT(cb_latent->type == GGML_TYPE_F32 && cb_rope->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(cb_latent) == 31 && ggml_nelements(cb_rope) == 31);
+    GGML_ASSERT(4*packed->ne[0] >= ggml_merc_tq_row_bytes(r, rd, G));
+    GGML_ASSERT(packed->nb[0] == sizeof(float));
+    const int64_t n = ggml_nrows(packed);
+    struct ggml_tensor * result = mode == 0
+        ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r + rd + G, n)
+        : ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+    ggml_set_op_params_i32(result, 0, mode);
+    ggml_set_op_params_i32(result, 1, r);
+    ggml_set_op_params_i32(result, 2, rd);
+    ggml_set_op_params_i32(result, 3, G);
+    result->op     = GGML_OP_MERC_TQ_UNPACK;
+    result->src[0] = packed;
+    result->src[1] = cb_latent;
+    result->src[2] = cb_rope;
     return result;
 }
 

@@ -10802,7 +10802,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous(src_state));
 
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
-    GGML_ASSERT(src_beta->ne[0] == 1);
+    GGML_ASSERT(src_beta->ne[0] == 1 || src_beta->ne[0] == S_v);
+    const bool beta_ch = src_beta->ne[0] == S_v;     // GDN-2 erase gate: delta = v - S^T (b * k)
 
     GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
     GGML_TENSOR_LOCALS(size_t,  nbq, src_q, nb);
@@ -10829,11 +10830,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // token's ingredients rather than the K==1 "write straight to output" fast path below).
     const bool use_scratch = (K > 1) || (emit_mode != 0);
 
-    const int64_t per_thread = S_v + (use_scratch ? S_v * S_v : 0);
+    const int64_t per_thread = 2 * S_v + (use_scratch ? S_v * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work  = use_scratch ? (delta + S_v) : nullptr;
+    float * kb          = delta + S_v;               // b * k (channel-wise beta only)
+    float * state_work  = use_scratch ? (kb + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states (| final_state | ckpt_state), emit_mode==1 only]
     // attn_scores: S_v * H * n_tokens * n_seqs                                  floats
@@ -10895,7 +10897,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
 
-            const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+            const float * beta_d = (const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+            const float beta_val = beta_ch ? 1.0f : *beta_d;
             const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
 
             // state is stored transposed: s_out[j*S_v + i] = S[i][j]
@@ -10914,10 +10917,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
             }
 
-            // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
+            // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)   (channel-wise beta: k -> b * k, beta_val = 1)
+            const float * k_proj = k_d;
+            if (beta_ch) {
+                ggml_vec_mul_f32(S_v, kb, k_d, beta_d);
+                k_proj = kb;
+            }
             for (int64_t j = 0; j < S_v; ++j) {
                 float sum = 0.0f;
-                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
+                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_proj, 0, 1);
                 delta[j] = (v_d[j] - sum) * beta_val;
             }
 
@@ -11328,6 +11336,93 @@ void ggml_compute_forward_dsv4_hc_post(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_merc_tq_pack / unpack (Mercurius compressed attention cache, see ggml.h)
+
+static inline uint8_t merc_tq_index(float u, const float * bnd) {
+    uint8_t i = 0;                       // torch.bucketize(u, bnd): number of boundaries strictly below u
+    for (int j = 0; j < 15; ++j) {
+        i += bnd[j] < u;
+    }
+    return i;
+}
+
+static void merc_tq_encode(const float * x, int n, const float * cb, uint8_t * codes, ggml_fp16_t * norm_out) {
+    double ss = 0.0;
+    for (int i = 0; i < n; ++i) {
+        ss += (double) x[i] * x[i];
+    }
+    const ggml_fp16_t nh = GGML_CPU_FP32_TO_FP16((float) sqrt(ss));
+    *norm_out = nh;
+    float nf = GGML_CPU_FP16_TO_FP32(nh);
+    nf = nf > 1e-12f ? nf : 1e-12f;
+    const float * bnd = cb + 16;
+    for (int i = 0; i < n; i += 2) {
+        const uint8_t lo = merc_tq_index(x[i] / nf, bnd);
+        const uint8_t hi = i + 1 < n ? merc_tq_index(x[i + 1] / nf, bnd) : 0;
+        codes[i / 2] = lo | (uint8_t) (hi << 4);
+    }
+}
+
+static void merc_tq_decode(const uint8_t * codes, ggml_fp16_t nh, int n, const float * cb, float * y) {
+    float nf = GGML_CPU_FP16_TO_FP32(nh);
+    nf = nf > 1e-12f ? nf : 1e-12f;
+    for (int i = 0; i < n; ++i) {
+        const uint8_t b = codes[i / 2];
+        y[i] = cb[(i & 1) ? (b >> 4) : (b & 15)] * nf;
+    }
+}
+
+void ggml_compute_forward_merc_tq_pack(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * c   = dst->src[0];
+    const ggml_tensor * kr  = dst->src[1];
+    const ggml_tensor * ir  = dst->src[2];
+    const ggml_tensor * pos = dst->src[3];
+    const float * cbl = (const float *) dst->src[4]->data;
+    const float * cbr = (const float *) dst->src[5]->data;
+    const int r = ggml_get_op_params_i32(dst, 1), rd = ggml_get_op_params_i32(dst, 2), G = ggml_get_op_params_i32(dst, 3);
+    const int64_t T = dst->ne[1];
+    for (int64_t t = params->ith; t < T; t += params->nth) {
+        uint8_t * row = (uint8_t *) dst->data + t * dst->nb[1];
+        memset(row, 0, dst->ne[0] * sizeof(float));
+        const int32_t p = ((const int32_t *) pos->data)[t];
+        memcpy(row, &p, 4);
+        const float * irow = (const float *) ((const char *) ir->data + t * ir->nb[1]);
+        memcpy(row + 4, irow, 4 * G);
+        ggml_fp16_t nl, nr;
+        uint8_t * rope_codes = row + 4 + 4 * G + 4;
+        uint8_t * lat_codes  = rope_codes + rd / 2;
+        merc_tq_encode((const float *) ((const char *) kr->data + t * kr->nb[1]), rd, cbr, rope_codes, &nr);
+        merc_tq_encode((const float *) ((const char *) c->data  + t * c->nb[1]),  r,  cbl, lat_codes,  &nl);
+        memcpy(row + 4 + 4 * G,     &nl, 2);
+        memcpy(row + 4 + 4 * G + 2, &nr, 2);
+    }
+}
+
+void ggml_compute_forward_merc_tq_unpack(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * pk = dst->src[0];
+    const float * cbl = (const float *) dst->src[1]->data;
+    const float * cbr = (const float *) dst->src[2]->data;
+    const int mode = ggml_get_op_params_i32(dst, 0);
+    const int r = ggml_get_op_params_i32(dst, 1), rd = ggml_get_op_params_i32(dst, 2), G = ggml_get_op_params_i32(dst, 3);
+    const int64_t n = ggml_nrows(pk);
+    for (int64_t t = params->ith; t < n; t += params->nth) {
+        const int64_t i1 = t % pk->ne[1], i2 = (t / pk->ne[1]) % pk->ne[2], i3 = t / (pk->ne[1] * pk->ne[2]);
+        const uint8_t * row = (const uint8_t *) pk->data + i1 * pk->nb[1] + i2 * pk->nb[2] + i3 * pk->nb[3];
+        if (mode == 1) {
+            memcpy((int32_t *) dst->data + t, row, 4);
+            continue;
+        }
+        float * y = (float *) ((char *) dst->data + t * dst->nb[1]);
+        ggml_fp16_t nl, nr;
+        memcpy(&nl, row + 4 + 4 * G, 2);
+        memcpy(&nr, row + 4 + 4 * G + 2, 2);
+        const uint8_t * rope_codes = row + 4 + 4 * G + 4;
+        merc_tq_decode(rope_codes + rd / 2, nl, r, cbl, y);
+        merc_tq_decode(rope_codes, nr, rd, cbr, y + r);
+        memcpy(y + r + rd, row + 4, 4 * G);
     }
 }
 

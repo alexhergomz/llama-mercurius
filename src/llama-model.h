@@ -448,6 +448,21 @@ struct llama_layer {
     struct ggml_tensor * ssm_alpha_s = nullptr;
     struct ggml_tensor * ssm_beta_s  = nullptr;
 
+    // mercurius (absorbed MLA with TurboQuant cache; factored GDN-2 gates)
+    struct ggml_tensor * merc_q_map        = nullptr;
+    struct ggml_tensor * merc_k_rope       = nullptr;
+    struct ggml_tensor * merc_rope_unrot   = nullptr;
+    struct ggml_tensor * merc_latent       = nullptr;
+    struct ggml_tensor * merc_v_up         = nullptr;
+    struct ggml_tensor * merc_k_rms        = nullptr;
+    struct ggml_tensor * merc_tq_latent_cb = nullptr;
+    struct ggml_tensor * merc_tq_rope_cb   = nullptr;
+    struct ggml_tensor * merc_a_lora_a     = nullptr;
+    struct ggml_tensor * merc_a_lora_b     = nullptr;
+    struct ggml_tensor * merc_gate_base[3] = {};   // a (decay), be (erase), bw (write)
+    struct ggml_tensor * merc_gate_vd[3]   = {};
+    struct ggml_tensor * merc_gate_vb[3]   = {};
+
     // input scales
     struct ggml_tensor * wq_in_s            = nullptr;
     struct ggml_tensor * wk_in_s            = nullptr;
@@ -599,6 +614,8 @@ struct llama_model {
     std::vector<std::string> classifier_labels;
 
     struct ggml_tensor * tok_embd   = nullptr;
+    struct ggml_tensor * merc_vera_a = nullptr;   // mercurius: VeRA factors shared by every gate
+    struct ggml_tensor * merc_vera_b = nullptr;
     struct ggml_tensor * type_embd  = nullptr;
     struct ggml_tensor * pos_embd   = nullptr;
     struct ggml_tensor * tok_norm   = nullptr;
