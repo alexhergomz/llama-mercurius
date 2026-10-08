@@ -1,5 +1,9 @@
 # llama.cpp
 
+> **llama-mercurius:** this fork adds support for [Mercurius-1-4B](https://huggingface.co/Minerva-Laboratories/Mercurius-1-4B)
+> (absorbed MLA, GDN-2, 4-bit TurboQuant KV cache, NF4 weights). Use branch `mercurius`; see
+> [docs/mercurius.md](docs/mercurius.md) for build, usage and supported hardware.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">

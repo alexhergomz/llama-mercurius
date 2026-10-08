@@ -1,6 +1,20 @@
 #include "merc-tq.cuh"
 #include "cp-async.cuh"
 
+// 16-byte global -> shared copy: cp.async on Ampere and newer, a plain vector copy before (Volta / Turing)
+static __device__ __forceinline__ void merc_copy16(void * dst_smem, const void * src) {
+#ifdef CP_ASYNC_AVAILABLE
+    cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(dst_smem), src);
+#else
+    *(int4 *) dst_smem = *(const int4 *) src;
+#endif // CP_ASYNC_AVAILABLE
+}
+static __device__ __forceinline__ void merc_copy_wait() {
+#ifdef CP_ASYNC_AVAILABLE
+    cp_async_wait_all();
+#endif // CP_ASYNC_AVAILABLE
+}
+
 // Row layout (bytes): [pos i32 | inv_r f32 x G | latent norm f16 | rope norm f16 | rope codes rd/2 | latent codes ceil(r/2)]
 // Codes: index = #{boundaries < x / n} (torch.bucketize), n = fp16(||x||) clamped at 1e-12; decode centroid[index] * n.
 // Same arithmetic as the CPU reference (ggml-cpu/ops.cpp) and mercurius.models.qat.tq_roundtrip.
@@ -222,7 +236,7 @@ static __global__ void __launch_bounds__(MERC_ATTN_THREADS) merc_tq_attn_split(
         if (rows_async) {
             const int bytes = nc * row_words * 4, nseg = bytes / 16;
             for (int sg = tid; sg < nseg; sg += MERC_ATTN_THREADS) {
-                cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(rows + 4 * sg), src + 16 * sg);
+                merc_copy16(rows + 4 * sg, src + 16 * sg);
             }
             for (int w = 4 * nseg + tid; w < bytes / 4; w += MERC_ATTN_THREADS) rows[w] = ((const uint32_t *) src)[w];
         } else {
@@ -250,7 +264,7 @@ static __global__ void __launch_bounds__(MERC_ATTN_THREADS) merc_tq_attn_split(
     for (int chunk = c_begin; chunk < c_end; ++chunk) {
         const int j0 = chunk * MERC_ATTN_CHUNK;
         const int nc = min(MERC_ATTN_CHUNK, n_kv - j0);
-        cp_async_wait_all();
+        merc_copy_wait();
         __syncthreads();                                   // rows of this chunk in place; previous chunk consumed
         if (tid == 0) any_rescale = 0;
 
@@ -575,18 +589,18 @@ static __global__ void __launch_bounds__(MSP_THR) merc_tq_attn_prefill_smem(
         half * Ks = Kb + b * MDB_KT * Es;
         for (int i = tid; i < MDB_KT * segs; i += MSP_THR) {
             const int cell = i / segs, sg = i % segs;
-            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(Ks + cell * Es + sg * 8), Kd + (int64_t) (j0 + cell) * Ep + sg * 8);
+            merc_copy16(Ks + cell * Es + sg * 8, Kd + (int64_t) (j0 + cell) * Ep + sg * 8);
         }
         constexpr int mseg = MDB_KT * (int) sizeof(mask_t) / 16;    // 16-byte segments per token's mask row
         if (tid < MDB_KT) {                                        // rms rows (16 bytes per cell)
-            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(rmst + b * MDB_KT * 4 + tid * 4), rmsd + (int64_t) (j0 + tid) * 4);
+            merc_copy16(rmst + b * MDB_KT * 4 + tid * 4, rmsd + (int64_t) (j0 + tid) * 4);
         } else if (mask && tid < MDB_KT + MSP_TQ * mseg) {          // mask rows of the block's tokens
             const int i = tid - MDB_KT, tq = i / mseg, sg = i % mseg, t = min(t0 + tq, T - 1);
             constexpr int cps = 16 / (int) sizeof(mask_t);          // cells per 16-byte segment
             mask_t * dstm = mskt + b * MSP_TQ * MDB_KT + tq * MDB_KT + sg * cps;
             const mask_t * srcm = mask + t * mask_nb1 + j0 + sg * cps;
             if (mask_al16 && j0 + (sg + 1) * cps <= mask_ne0) {
-                cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(dstm), srcm);
+                merc_copy16(dstm, srcm);
             } else {                                                // row tail / unaligned rows: element by element
                 for (int c = 0; c < cps; ++c) dstm[c] = j0 + sg * cps + c < mask_ne0 ? srcm[c] : (mask_t) -INFINITY;
             }
@@ -606,7 +620,7 @@ static __global__ void __launch_bounds__(MSP_THR) merc_tq_attn_prefill_smem(
     if (jend > 0) stage(0, 0);
     for (int j0 = 0, it = 0; j0 < jend; j0 += MDB_KT, ++it) {
         const int b = it & 1;
-        cp_async_wait_all();
+        merc_copy_wait();
         __syncthreads();                                          // tile b (and its mask/rms) visible to all
         if (j0 + MDB_KT < jend) stage(j0 + MDB_KT, b ^ 1);        // prefetch the next tile
         if (tid == 0) any_rescale = 0;
@@ -913,7 +927,7 @@ struct merc_prefill_layout {
 };
 
 static merc_prefill_layout merc_prefill_get_layout(const ggml_tensor * dst) {
-    const ggml_tensor * pk = dst->src[1], * ku = dst->src[5], * vu = dst->src[6];
+    const ggml_tensor * pk = dst->src[1], * vu = dst->src[6];
     const int r = ggml_get_op_params_i32(dst, 0), rd = ggml_get_op_params_i32(dst, 1), G = ggml_get_op_params_i32(dst, 2);
     const int64_t D = vu->ne[1], Ek = dst->src[0]->ne[0];
     const int64_t n_kv = pk->ne[1] * pk->ne[2];
